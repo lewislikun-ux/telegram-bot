@@ -29,7 +29,22 @@ app.use(express.json({ limit: '2mb' }));
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { webHook: true });
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-const WEEKDAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+const MAIN_KEYBOARD = {
+  inline_keyboard: [
+    [
+      { text: '➕ Note', callback_data: 'hint:note' },
+      { text: '✅ Task', callback_data: 'hint:task' },
+    ],
+    [
+      { text: '📅 Due', callback_data: 'show:due' },
+      { text: '🗓 Weekly', callback_data: 'show:weekly' },
+    ],
+    [
+      { text: '🚗 PHV Today', callback_data: 'show:phvtoday' },
+      { text: '🧠 Decide', callback_data: 'hint:decide' },
+    ],
+  ],
+};
 
 function escapeHtml(text = '') {
   return String(text)
@@ -42,8 +57,20 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function toLocalDate(date = new Date()) {
+  const offsetMs = 8 * 60 * 60 * 1000;
+  return new Date(date.getTime() + offsetMs);
+}
+
 function todayDateString() {
-  return new Date().toISOString().slice(0, 10);
+  return toLocalDate().toISOString().slice(0, 10);
+}
+
+function startOfLocalDayIso(daysOffset = 0) {
+  const d = toLocalDate();
+  d.setUTCHours(0, 0, 0, 0);
+  d.setUTCDate(d.getUTCDate() + daysOffset);
+  return new Date(d.getTime() - 8 * 60 * 60 * 1000).toISOString();
 }
 
 function parseDateTimeInput(input) {
@@ -52,51 +79,70 @@ function parseDateTimeInput(input) {
   if (!match) return null;
   const datePart = match[1];
   const timePart = match[2] || '09:00';
-  const iso = new Date(`${datePart}T${timePart}:00`);
+  const iso = new Date(`${datePart}T${timePart}:00+08:00`);
   if (Number.isNaN(iso.getTime())) return null;
   return { date: datePart, time: timePart, iso: iso.toISOString() };
-}
-
-function addMonths(date, count) {
-  const d = new Date(date);
-  d.setMonth(d.getMonth() + count);
-  return d;
-}
-
-function addYears(date, count) {
-  const d = new Date(date);
-  d.setFullYear(d.getFullYear() + count);
-  return d;
-}
-
-function computeNextDueDate(baseDate, recurrence) {
-  const d = new Date(baseDate);
-  if (Number.isNaN(d.getTime())) return null;
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-
-  if (!recurrence || recurrence === 'none') return d;
-
-  while (d < today) {
-    if (recurrence === 'monthly') {
-      d.setMonth(d.getMonth() + 1);
-    } else if (recurrence === 'yearly') {
-      d.setFullYear(d.getFullYear() + 1);
-    } else {
-      break;
-    }
-  }
-  return d;
 }
 
 function formatDate(dateValue) {
   const d = new Date(dateValue);
   if (Number.isNaN(d.getTime())) return String(dateValue || '');
+  return toLocalDate(d).toISOString().slice(0, 10);
+}
+
+function formatDateTime(dateValue) {
+  const d = new Date(dateValue);
+  if (Number.isNaN(d.getTime())) return String(dateValue || '');
+  const local = toLocalDate(d);
+  return `${local.toISOString().slice(0, 10)} ${local.toISOString().slice(11, 16)}`;
+}
+
+function dueInDays(dateString) {
+  const today = new Date(`${todayDateString()}T00:00:00+08:00`);
+  const due = new Date(`${String(dateString).slice(0, 10)}T00:00:00+08:00`);
+  return Math.round((due - today) / 86400000);
+}
+
+function addMonths(dateString, count) {
+  const d = new Date(`${String(dateString).slice(0, 10)}T12:00:00+08:00`);
+  d.setMonth(d.getMonth() + count);
   return d.toISOString().slice(0, 10);
 }
 
+function addYears(dateString, count) {
+  const d = new Date(`${String(dateString).slice(0, 10)}T12:00:00+08:00`);
+  d.setFullYear(d.getFullYear() + count);
+  return d.toISOString().slice(0, 10);
+}
+
+function computeNextDueDate(baseDate, recurrence) {
+  let next = String(baseDate).slice(0, 10);
+  const today = todayDateString();
+  if (!recurrence || recurrence === 'none') return next;
+
+  while (next < today) {
+    if (recurrence === 'monthly') next = addMonths(next, 1);
+    else if (recurrence === 'yearly') next = addYears(next, 1);
+    else break;
+  }
+  return next;
+}
+
+function computeFollowingDueDate(currentDueDate, recurrence) {
+  if (recurrence === 'monthly') return addMonths(currentDueDate, 1);
+  if (recurrence === 'yearly') return addYears(currentDueDate, 1);
+  return currentDueDate;
+}
+
+function humanDueLabel(days) {
+  if (days < 0) return `${Math.abs(days)} day(s) overdue`;
+  if (days === 0) return 'due today';
+  if (days === 1) return 'due tomorrow';
+  return `due in ${days} day(s)`;
+}
+
 function parseAdminAdd(text) {
-  const parts = text.split('|').map((s) => s.trim());
+  const parts = String(text || '').split('|').map((s) => s.trim());
   if (parts.length < 3) return null;
 
   const title = parts[0];
@@ -107,26 +153,135 @@ function parseAdminAdd(text) {
   if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return null;
   if (!['none', 'monthly', 'yearly'].includes(recurrence)) return null;
 
-  const leadDays = leadDaysRaw
-    .split(',')
-    .map((x) => parseInt(x.trim(), 10))
-    .filter((n) => Number.isInteger(n) && n >= 0)
-    .slice(0, 10);
+  let leadDays = [];
+  if (leadDaysRaw.toLowerCase() !== 'none') {
+    leadDays = leadDaysRaw
+      .split(',')
+      .map((x) => parseInt(x.trim(), 10))
+      .filter((n) => Number.isInteger(n) && n >= 0)
+      .slice(0, 10);
+  }
 
   return {
     title,
     dueDate,
     recurrence,
-    leadDays: leadDays.length ? leadDays : [7, 1],
+    leadDays,
   };
 }
 
-function dueInDays(dateString) {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const due = new Date(dateString);
-  due.setHours(0, 0, 0, 0);
-  return Math.round((due - today) / 86400000);
+function parsePhvBody(body) {
+  const parts = String(body || '').split('|').map((s) => s.trim()).filter(Boolean);
+  const result = {};
+
+  for (const part of parts) {
+    const m = part.match(/^(date|gross|hours|km|petrol|trip|notes?)\s*[:=]?\s*(.+)$/i);
+    if (!m) continue;
+    const key = m[1].toLowerCase();
+    const value = m[2].trim();
+    result[key] = value;
+  }
+
+  const date = result.date || todayDateString();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+
+  const gross = parseFloat(result.gross || '');
+  const hours = parseFloat(result.hours || '');
+  const km = parseFloat(result.km || '');
+  const petrol = result.petrol !== undefined ? parseFloat(result.petrol) : null;
+  const tripCount = result.trip !== undefined ? parseInt(result.trip, 10) : null;
+  const notes = result.note || result.notes || null;
+
+  if (!Number.isFinite(gross) || !Number.isFinite(hours)) return null;
+
+  return {
+    log_date: date,
+    gross_amount: gross,
+    hours_worked: hours,
+    km_driven: Number.isFinite(km) ? km : null,
+    petrol_cost: Number.isFinite(petrol) ? petrol : null,
+    trip_count: Number.isInteger(tripCount) ? tripCount : null,
+    notes,
+  };
+}
+
+function currency(n) {
+  if (n === null || n === undefined || Number.isNaN(Number(n))) return '-';
+  return `$${Number(n).toFixed(2)}`;
+}
+
+function phvComputed(log) {
+  const gross = Number(log.gross_amount || 0);
+  const petrol = Number(log.petrol_cost || 0);
+  const hours = Number(log.hours_worked || 0);
+  const net = gross - petrol;
+  const hourlyGross = hours > 0 ? gross / hours : 0;
+  const hourlyNet = hours > 0 ? net / hours : 0;
+  return { net, hourlyGross, hourlyNet };
+}
+
+function buildDecisionAdvice(input) {
+  const text = String(input || '').trim();
+  const lower = text.toLowerCase();
+  const amountMatches = [...lower.matchAll(/\$?\s*(\d+(?:\.\d+)?)/g)].map((m) => Number(m[1]));
+  const amount = amountMatches[0] || null;
+  const urgencyWords = ['urgent', 'today', 'asap', 'immediately', 'now'];
+  const delayWords = ['wait', 'delay', 'later', 'hold'];
+  const repairWords = ['repair', 'service', 'tyre', 'tire', 'insurance', 'renew', 'road tax', 'maintenance'];
+  const investWords = ['invest', 'etf', 'vwra', 'ssb', 'stocks', 'buy'];
+  const restWords = ['rest', 'sleep', 'fatigue', 'tired'];
+
+  let recommendation = 'Lean toward doing the lower-risk option first.';
+  let risk = 'medium';
+  const reasons = [];
+  const actions = [];
+
+  if (repairWords.some((w) => lower.includes(w))) {
+    recommendation = 'If this affects safety, legality, or insurance coverage, do it now instead of delaying.';
+    risk = 'medium-high';
+    reasons.push('Delaying maintenance or renewals can become more expensive or risky later.');
+    actions.push('Check exact due date or service threshold.', 'If cash is tight, prioritize the safety-critical item first.');
+  }
+
+  if (investWords.some((w) => lower.includes(w))) {
+    recommendation = 'Only proceed if your near-term cash needs and emergency buffer are already covered.';
+    risk = 'medium';
+    reasons.push('Investing while cash is tight can force you to sell or stop at the wrong time.');
+    actions.push('Set a fixed monthly amount you can sustain.', 'Keep enough cash for bills due soon.');
+  }
+
+  if (restWords.some((w) => lower.includes(w))) {
+    recommendation = 'Protect sleep and recovery first if the choice affects safety or work quality.';
+    risk = 'high';
+    reasons.push('Fatigue affects driving performance, judgment, and consistency.');
+    actions.push('Cut lower-value tasks today.', 'Reassess after proper rest.');
+  }
+
+  if (delayWords.some((w) => lower.includes(w)) && !repairWords.some((w) => lower.includes(w))) {
+    reasons.push('Waiting can be sensible if the downside of delay is low and cash preservation matters.');
+  }
+
+  if (urgencyWords.some((w) => lower.includes(w))) {
+    reasons.push('Your wording suggests a time-sensitive decision.');
+  }
+
+  if (amount !== null) {
+    if (amount >= 1000) {
+      reasons.push('This is a meaningful amount, so cashflow impact matters.');
+      actions.push('Check whether this amount conflicts with other bills due within 30 days.');
+    } else {
+      reasons.push('The amount is manageable, so convenience and risk reduction may matter more than perfect optimization.');
+    }
+  }
+
+  if (!reasons.length) {
+    reasons.push('Start with the option that reduces downside and keeps future choices open.');
+  }
+  if (!actions.length) {
+    actions.push('Clarify the downside of waiting 7–30 days.', 'Choose the option you can sustain repeatedly, not just once.');
+  }
+
+  return { recommendation, risk, reasons: reasons.slice(0, 3), actions: actions.slice(0, 3) };
 }
 
 async function ensureUser(msg) {
@@ -145,9 +300,7 @@ async function ensureUser(msg) {
     .from('users')
     .upsert(payload, { onConflict: 'telegram_user_id' });
 
-  if (error) {
-    console.error('ensureUser error', error);
-  }
+  if (error) console.error('ensureUser error', error);
 }
 
 async function send(chatId, text, options = {}) {
@@ -158,31 +311,60 @@ async function send(chatId, text, options = {}) {
   });
 }
 
+async function editOrSend(chatId, messageId, text, options = {}) {
+  try {
+    return await bot.editMessageText(text, {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...options,
+    });
+  } catch (_err) {
+    return send(chatId, text, options);
+  }
+}
+
+async function answerCallback(callbackQueryId, text) {
+  try {
+    await bot.answerCallbackQuery(callbackQueryId, text ? { text } : {});
+  } catch (error) {
+    console.error('answerCallback error', error);
+  }
+}
+
 async function showHelp(chatId) {
   const helpText = [
-    '<b>Phase 1 Bot Commands</b>',
+    '<b>Personal Ops Bot — Phase 2 browser build</b>',
     '',
-    '<b>Notes / tasks</b>',
+    '<b>Main commands</b>',
     '/note your text',
     '/task your task',
     '/done keyword',
-    '',
-    '<b>Reminders</b>',
     '/remind YYYY-MM-DD HH:MM | message',
-    'Example: /remind 2026-04-02 09:00 | renew road tax',
-    '',
-    '<b>Admin items</b>',
     '/adminadd title | YYYY-MM-DD | none|monthly|yearly | 30,7,1',
-    'Example: /adminadd car insurance | 2026-07-10 | yearly | 30,7,1',
+    '/admindone keyword',
     '/due',
-    '',
-    '<b>Search / summary</b>',
     '/search keyword',
     '/weekly',
-    '/menu',
+    '',
+    '<b>Phase 2</b>',
+    '/phvlog date:2026-03-27 | gross:145 | hours:2.5 | km:68 | petrol:18',
+    '/phvtoday',
+    '/phvweek',
+    '/decide your question',
+    '',
+    '<b>Natural language examples</b>',
+    'note: check tyre pressure',
+    'task: renew road tax',
+    'idea: add mileage reminders',
+    'done: renew road tax',
+    'due',
+    'weekly',
+    'decide: should I service now or wait 1 month?',
   ].join('\n');
 
-  await send(chatId, helpText);
+  await send(chatId, helpText, { reply_markup: MAIN_KEYBOARD });
 }
 
 async function getOpenTasks(userId) {
@@ -199,7 +381,7 @@ async function getOpenTasks(userId) {
 }
 
 async function getDueItems(userId) {
-  const today = todayDateString();
+  const todayEndIso = startOfLocalDayIso(1);
 
   const [{ data: reminders, error: rErr }, { data: adminItems, error: aErr }] = await Promise.all([
     supabase
@@ -207,23 +389,39 @@ async function getDueItems(userId) {
       .select('*')
       .eq('telegram_user_id', userId)
       .eq('status', 'open')
-      .lte('remind_at', `${today}T23:59:59.999Z`)
+      .lt('remind_at', todayEndIso)
       .order('remind_at', { ascending: true })
       .limit(20),
     supabase
       .from('admin_items')
       .select('*')
       .eq('telegram_user_id', userId)
+      .eq('is_active', true)
       .order('next_due_date', { ascending: true })
-      .limit(20),
+      .limit(50),
   ]);
 
   if (rErr) throw rErr;
   if (aErr) throw aErr;
 
-  const dueAdmin = (adminItems || []).filter((item) => dueInDays(item.next_due_date) <= Math.max(...(item.lead_days || [7])));
+  const dueAdmin = (adminItems || []).filter((item) => {
+    const leadDays = item.lead_days || [];
+    if (!leadDays.length) return dueInDays(item.next_due_date) <= 0;
+    return dueInDays(item.next_due_date) <= Math.max(...leadDays);
+  });
 
-  return { reminders: reminders || [], adminItems: dueAdmin };
+  return { reminders: reminders || [], adminItems: dueAdmin, allAdminItems: adminItems || [] };
+}
+
+async function saveNote(msg, content, noteType = 'note') {
+  const { error } = await supabase.from('notes').insert({
+    telegram_user_id: msg.from.id,
+    chat_id: msg.chat.id,
+    note_type: noteType,
+    content,
+    created_at: nowIso(),
+  });
+  if (error) throw error;
 }
 
 async function handleStart(msg) {
@@ -231,28 +429,21 @@ async function handleStart(msg) {
   const name = escapeHtml(msg.from.first_name || 'there');
   await send(
     msg.chat.id,
-    `Hello ${name}.\n\nThis is your <b>Phase 1 personal ops bot</b>.\nUse /help to see commands.`
+    `Hello ${name}.\n\nThis is your <b>browser-only personal ops bot</b>.\nTap a button or use /help.`,
+    { reply_markup: MAIN_KEYBOARD }
   );
 }
 
-async function handleNote(msg, body) {
+async function handleNote(msg, body, noteType = 'note') {
   if (!body) return send(msg.chat.id, 'Use: <code>/note your text</code>');
   await ensureUser(msg);
-
-  const { error } = await supabase.from('notes').insert({
-    telegram_user_id: msg.from.id,
-    chat_id: msg.chat.id,
-    note_type: 'note',
-    content: body,
-    created_at: nowIso(),
-  });
-
-  if (error) {
+  try {
+    await saveNote(msg, body, noteType);
+    await send(msg.chat.id, `Saved ${escapeHtml(noteType)}:\n<blockquote>${escapeHtml(body)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
+  } catch (error) {
     console.error(error);
-    return send(msg.chat.id, 'Could not save note.');
+    await send(msg.chat.id, `Could not save ${escapeHtml(noteType)}.`);
   }
-
-  await send(msg.chat.id, `Saved note:\n<blockquote>${escapeHtml(body)}</blockquote>`);
 }
 
 async function handleTask(msg, body) {
@@ -273,7 +464,7 @@ async function handleTask(msg, body) {
     return send(msg.chat.id, 'Could not save task.');
   }
 
-  await send(msg.chat.id, `Saved task:\n<blockquote>${escapeHtml(body)}</blockquote>`);
+  await send(msg.chat.id, `Saved task:\n<blockquote>${escapeHtml(body)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
 }
 
 async function handleDone(msg, keyword) {
@@ -307,7 +498,7 @@ async function handleDone(msg, keyword) {
     return send(msg.chat.id, 'Could not mark task done.');
   }
 
-  await send(msg.chat.id, `Marked done:\n<blockquote>${escapeHtml(task.content)}</blockquote>`);
+  await send(msg.chat.id, `Marked done:\n<blockquote>${escapeHtml(task.content)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
 }
 
 async function handleRemind(msg, body) {
@@ -340,7 +531,8 @@ async function handleRemind(msg, body) {
 
   await send(
     msg.chat.id,
-    `Saved reminder for <b>${escapeHtml(datePart.date)} ${escapeHtml(datePart.time)}</b>:\n<blockquote>${escapeHtml(reminderText)}</blockquote>\n\nUse <code>/due</code> to check due items.`
+    `Saved reminder for <b>${escapeHtml(datePart.date)} ${escapeHtml(datePart.time)}</b>:\n<blockquote>${escapeHtml(reminderText)}</blockquote>`,
+    { reply_markup: MAIN_KEYBOARD }
   );
 }
 
@@ -352,14 +544,13 @@ async function handleAdminAdd(msg, body) {
   await ensureUser(msg);
 
   const nextDue = computeNextDueDate(parsed.dueDate, parsed.recurrence);
-  if (!nextDue) return send(msg.chat.id, 'Could not compute the due date.');
 
   const { error } = await supabase.from('admin_items').insert({
     telegram_user_id: msg.from.id,
     chat_id: msg.chat.id,
     title: parsed.title,
     base_due_date: parsed.dueDate,
-    next_due_date: formatDate(nextDue),
+    next_due_date: nextDue,
     recurrence: parsed.recurrence,
     lead_days: parsed.leadDays,
     is_active: true,
@@ -372,44 +563,126 @@ async function handleAdminAdd(msg, body) {
     return send(msg.chat.id, 'Could not save admin item.');
   }
 
+  const leadText = parsed.leadDays.length ? parsed.leadDays.join(', ') : 'none';
   await send(
     msg.chat.id,
-    `Saved admin item:\n<b>${escapeHtml(parsed.title)}</b>\nDue: <b>${escapeHtml(formatDate(nextDue))}</b>\nRecurrence: <b>${escapeHtml(parsed.recurrence)}</b>\nLead days: <b>${escapeHtml(parsed.leadDays.join(', '))}</b>`
+    `Saved admin item:\n<b>${escapeHtml(parsed.title)}</b>\nDue: <b>${escapeHtml(nextDue)}</b>\nRecurrence: <b>${escapeHtml(parsed.recurrence)}</b>\nLead days: <b>${escapeHtml(leadText)}</b>`,
+    { reply_markup: MAIN_KEYBOARD }
   );
 }
 
-async function handleDue(msg) {
+async function findAdminItem(userId, keyword) {
+  const { data, error } = await supabase
+    .from('admin_items')
+    .select('*')
+    .eq('telegram_user_id', userId)
+    .eq('is_active', true)
+    .ilike('title', `%${keyword}%`)
+    .order('next_due_date', { ascending: true })
+    .limit(1);
+  if (error) throw error;
+  return data?.[0] || null;
+}
+
+async function completeAdminItemByRow(chatId, row) {
+  if (!row) return send(chatId, 'Admin item not found.');
+
+  if (row.recurrence === 'none') {
+    const { error } = await supabase
+      .from('admin_items')
+      .update({ is_active: false, updated_at: nowIso() })
+      .eq('id', row.id);
+    if (error) throw error;
+    return send(chatId, `✅ Marked done: <b>${escapeHtml(row.title)}</b>\nNo further reminders for this item.`, { reply_markup: MAIN_KEYBOARD });
+  }
+
+  const nextDue = computeFollowingDueDate(row.next_due_date, row.recurrence);
+  const { error } = await supabase
+    .from('admin_items')
+    .update({ base_due_date: nextDue, next_due_date: nextDue, updated_at: nowIso() })
+    .eq('id', row.id);
+  if (error) throw error;
+
+  return send(chatId, `✅ Marked done: <b>${escapeHtml(row.title)}</b>\nNext due: <b>${escapeHtml(nextDue)}</b>`, { reply_markup: MAIN_KEYBOARD });
+}
+
+async function handleAdminDone(msg, keyword) {
+  if (!keyword) return send(msg.chat.id, 'Use: <code>/admindone keyword</code>');
+  await ensureUser(msg);
+  try {
+    const row = await findAdminItem(msg.from.id, keyword);
+    if (!row) return send(msg.chat.id, 'No active admin item matched that keyword.');
+    return await completeAdminItemByRow(msg.chat.id, row);
+  } catch (error) {
+    console.error(error);
+    return send(msg.chat.id, 'Could not mark admin item done.');
+  }
+}
+
+function buildDueText(reminders, adminItems) {
+  const lines = ['<b>Due overview</b>', ''];
+
+  if (!reminders.length && !adminItems.length) {
+    lines.push('✅ Nothing urgent right now.');
+    return lines.join('\n');
+  }
+
+  if (reminders.length) {
+    lines.push('<b>Reminders due</b>');
+    reminders.forEach((r) => {
+      lines.push(`• ${escapeHtml(formatDateTime(r.remind_at))} — ${escapeHtml(r.content)}`);
+    });
+    lines.push('');
+  }
+
+  if (adminItems.length) {
+    const overdue = adminItems.filter((a) => dueInDays(a.next_due_date) < 0);
+    const today = adminItems.filter((a) => dueInDays(a.next_due_date) === 0);
+    const upcoming = adminItems.filter((a) => dueInDays(a.next_due_date) > 0);
+
+    if (overdue.length) {
+      lines.push('<b>Overdue admin items</b>');
+      overdue.forEach((a) => lines.push(`• ${escapeHtml(a.title)} — ${escapeHtml(a.next_due_date)} (${escapeHtml(humanDueLabel(dueInDays(a.next_due_date)))})`));
+      lines.push('');
+    }
+    if (today.length) {
+      lines.push('<b>Due today</b>');
+      today.forEach((a) => lines.push(`• ${escapeHtml(a.title)} — ${escapeHtml(a.next_due_date)}`));
+      lines.push('');
+    }
+    if (upcoming.length) {
+      lines.push('<b>Upcoming admin items</b>');
+      upcoming.forEach((a) => lines.push(`• ${escapeHtml(a.title)} — ${escapeHtml(a.next_due_date)} (${escapeHtml(humanDueLabel(dueInDays(a.next_due_date)))})`));
+    }
+  }
+
+  return lines.join('\n').trim();
+}
+
+function dueButtons(adminItems) {
+  const rows = [];
+  adminItems.slice(0, 5).forEach((item) => {
+    rows.push([{ text: `✅ Done: ${item.title.slice(0, 20)}`, callback_data: `admindone:${item.id}` }]);
+  });
+  rows.push([
+    { text: '🔄 Refresh due', callback_data: 'show:due' },
+    { text: '🗓 Weekly', callback_data: 'show:weekly' },
+  ]);
+  return { inline_keyboard: rows };
+}
+
+async function handleDue(msg, editContext = null) {
   await ensureUser(msg);
   try {
     const { reminders, adminItems } = await getDueItems(msg.from.id);
-
-    if (!reminders.length && !adminItems.length) {
-      return send(msg.chat.id, 'Nothing due right now.');
+    const text = buildDueText(reminders, adminItems);
+    if (editContext) {
+      return editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: dueButtons(adminItems) });
     }
-
-    const lines = ['<b>Due items</b>', ''];
-
-    if (reminders.length) {
-      lines.push('<b>Reminders</b>');
-      reminders.forEach((r) => {
-        lines.push(`• ${escapeHtml(formatDate(r.remind_at))} — ${escapeHtml(r.content)}`);
-      });
-      lines.push('');
-    }
-
-    if (adminItems.length) {
-      lines.push('<b>Admin items</b>');
-      adminItems.forEach((a) => {
-        const days = dueInDays(a.next_due_date);
-        const label = days < 0 ? `${Math.abs(days)} day(s) overdue` : days === 0 ? 'due today' : `due in ${days} day(s)`;
-        lines.push(`• ${escapeHtml(a.title)} — ${escapeHtml(a.next_due_date)} (${escapeHtml(label)})`);
-      });
-    }
-
-    await send(msg.chat.id, lines.join('\n'));
+    return send(msg.chat.id, text, { reply_markup: dueButtons(adminItems) });
   } catch (error) {
     console.error(error);
-    await send(msg.chat.id, 'Could not load due items.');
+    return send(msg.chat.id, 'Could not load due items.');
   }
 }
 
@@ -417,38 +690,15 @@ async function handleSearch(msg, keyword) {
   if (!keyword) return send(msg.chat.id, 'Use: <code>/search keyword</code>');
   await ensureUser(msg);
 
-  const [notesRes, tasksRes, remindersRes, adminRes] = await Promise.all([
-    supabase
-      .from('notes')
-      .select('*')
-      .eq('telegram_user_id', msg.from.id)
-      .ilike('content', `%${keyword}%`)
-      .order('created_at', { ascending: false })
-      .limit(5),
-    supabase
-      .from('tasks')
-      .select('*')
-      .eq('telegram_user_id', msg.from.id)
-      .ilike('content', `%${keyword}%`)
-      .order('created_at', { ascending: false })
-      .limit(5),
-    supabase
-      .from('reminders')
-      .select('*')
-      .eq('telegram_user_id', msg.from.id)
-      .ilike('content', `%${keyword}%`)
-      .order('created_at', { ascending: false })
-      .limit(5),
-    supabase
-      .from('admin_items')
-      .select('*')
-      .eq('telegram_user_id', msg.from.id)
-      .ilike('title', `%${keyword}%`)
-      .order('created_at', { ascending: false })
-      .limit(5),
+  const [notesRes, tasksRes, remindersRes, adminRes, phvRes] = await Promise.all([
+    supabase.from('notes').select('*').eq('telegram_user_id', msg.from.id).ilike('content', `%${keyword}%`).order('created_at', { ascending: false }).limit(5),
+    supabase.from('tasks').select('*').eq('telegram_user_id', msg.from.id).ilike('content', `%${keyword}%`).order('created_at', { ascending: false }).limit(5),
+    supabase.from('reminders').select('*').eq('telegram_user_id', msg.from.id).ilike('content', `%${keyword}%`).order('created_at', { ascending: false }).limit(5),
+    supabase.from('admin_items').select('*').eq('telegram_user_id', msg.from.id).ilike('title', `%${keyword}%`).order('created_at', { ascending: false }).limit(5),
+    supabase.from('phv_logs').select('*').eq('telegram_user_id', msg.from.id).ilike('notes', `%${keyword}%`).order('log_date', { ascending: false }).limit(5),
   ]);
 
-  const errors = [notesRes.error, tasksRes.error, remindersRes.error, adminRes.error].filter(Boolean);
+  const errors = [notesRes.error, tasksRes.error, remindersRes.error, adminRes.error, phvRes.error].filter(Boolean);
   if (errors.length) {
     console.error(errors);
     return send(msg.chat.id, 'Search failed.');
@@ -458,7 +708,7 @@ async function handleSearch(msg, keyword) {
 
   if (notesRes.data?.length) {
     lines.push('<b>Notes</b>');
-    notesRes.data.forEach((n) => lines.push(`• ${escapeHtml(n.content)}`));
+    notesRes.data.forEach((n) => lines.push(`• [${escapeHtml(n.note_type || 'note')}] ${escapeHtml(n.content)}`));
     lines.push('');
   }
   if (tasksRes.data?.length) {
@@ -468,42 +718,224 @@ async function handleSearch(msg, keyword) {
   }
   if (remindersRes.data?.length) {
     lines.push('<b>Reminders</b>');
-    remindersRes.data.forEach((r) => lines.push(`• ${escapeHtml(formatDate(r.remind_at))} — ${escapeHtml(r.content)}`));
+    remindersRes.data.forEach((r) => lines.push(`• ${escapeHtml(formatDateTime(r.remind_at))} — ${escapeHtml(r.content)}`));
     lines.push('');
   }
   if (adminRes.data?.length) {
     lines.push('<b>Admin items</b>');
     adminRes.data.forEach((a) => lines.push(`• ${escapeHtml(a.title)} — ${escapeHtml(a.next_due_date)}`));
+    lines.push('');
+  }
+  if (phvRes.data?.length) {
+    lines.push('<b>PHV logs</b>');
+    phvRes.data.forEach((p) => lines.push(`• ${escapeHtml(p.log_date)} — gross ${escapeHtml(currency(p.gross_amount))}`));
   }
 
-  if (lines.length <= 2) {
-    return send(msg.chat.id, 'No matches found.');
-  }
-
-  await send(msg.chat.id, lines.join('\n'));
+  if (lines.length <= 2) return send(msg.chat.id, 'No matches found.');
+  await send(msg.chat.id, lines.join('\n'), { reply_markup: MAIN_KEYBOARD });
 }
 
-async function handleWeekly(msg) {
+async function getPhvRange(userId, startDate, endDate) {
+  const { data, error } = await supabase
+    .from('phv_logs')
+    .select('*')
+    .eq('telegram_user_id', userId)
+    .gte('log_date', startDate)
+    .lte('log_date', endDate)
+    .order('log_date', { ascending: false });
+  if (error) throw error;
+  return data || [];
+}
+
+function summarizePhv(logs) {
+  const totals = logs.reduce((acc, log) => {
+    const c = phvComputed(log);
+    acc.gross += Number(log.gross_amount || 0);
+    acc.hours += Number(log.hours_worked || 0);
+    acc.petrol += Number(log.petrol_cost || 0);
+    acc.km += Number(log.km_driven || 0);
+    acc.net += c.net;
+    acc.days += 1;
+    return acc;
+  }, { gross: 0, hours: 0, petrol: 0, km: 0, net: 0, days: 0 });
+
+  totals.hourlyGross = totals.hours > 0 ? totals.gross / totals.hours : 0;
+  totals.hourlyNet = totals.hours > 0 ? totals.net / totals.hours : 0;
+  return totals;
+}
+
+async function handlePhvLog(msg, body) {
+  const parsed = parsePhvBody(body);
+  if (!parsed) {
+    return send(msg.chat.id, 'Use: <code>/phvlog date:2026-03-27 | gross:145 | hours:2.5 | km:68 | petrol:18 | notes:airport run</code>');
+  }
+  await ensureUser(msg);
+
+  const { error } = await supabase.from('phv_logs').insert({
+    telegram_user_id: msg.from.id,
+    chat_id: msg.chat.id,
+    ...parsed,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  });
+
+  if (error) {
+    console.error(error);
+    return send(msg.chat.id, 'Could not save PHV log.');
+  }
+
+  const c = phvComputed(parsed);
+  const lines = [
+    '<b>PHV log saved</b>',
+    `Date: <b>${escapeHtml(parsed.log_date)}</b>`,
+    `Gross: <b>${escapeHtml(currency(parsed.gross_amount))}</b>`,
+    `Hours: <b>${escapeHtml(String(parsed.hours_worked))}</b>`,
+    `Estimated net: <b>${escapeHtml(currency(c.net))}</b>`,
+    `Hourly gross: <b>${escapeHtml(currency(c.hourlyGross))}</b>`,
+    `Hourly net: <b>${escapeHtml(currency(c.hourlyNet))}</b>`,
+  ];
+  if (parsed.km_driven !== null) lines.push(`KM: <b>${escapeHtml(String(parsed.km_driven))}</b>`);
+  if (parsed.petrol_cost !== null) lines.push(`Petrol: <b>${escapeHtml(currency(parsed.petrol_cost))}</b>`);
+
+  await send(msg.chat.id, lines.join('\n'), { reply_markup: {
+    inline_keyboard: [
+      [
+        { text: '🚗 PHV Today', callback_data: 'show:phvtoday' },
+        { text: '📈 PHV Week', callback_data: 'show:phvweek' },
+      ],
+    ],
+  }});
+}
+
+async function handlePhvToday(msg, editContext = null) {
+  await ensureUser(msg);
+  try {
+    const logs = await getPhvRange(msg.from.id, todayDateString(), todayDateString());
+    if (!logs.length) {
+      const text = 'No PHV logs for today yet.';
+      return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
+    }
+    const s = summarizePhv(logs);
+    const lines = [
+      '<b>PHV today</b>',
+      `Date: <b>${escapeHtml(todayDateString())}</b>`,
+      `Trips logged: <b>${logs.length}</b>`,
+      `Gross: <b>${escapeHtml(currency(s.gross))}</b>`,
+      `Petrol: <b>${escapeHtml(currency(s.petrol))}</b>`,
+      `Estimated net: <b>${escapeHtml(currency(s.net))}</b>`,
+      `Hours: <b>${escapeHtml(s.hours.toFixed(2))}</b>`,
+      `Hourly gross: <b>${escapeHtml(currency(s.hourlyGross))}</b>`,
+      `Hourly net: <b>${escapeHtml(currency(s.hourlyNet))}</b>`,
+    ];
+    const opts = { reply_markup: { inline_keyboard: [[{ text: '📈 PHV Week', callback_data: 'show:phvweek' }, { text: '📅 Due', callback_data: 'show:due' }]] } };
+    return editContext ? editOrSend(msg.chat.id, editContext.messageId, lines.join('\n'), opts) : send(msg.chat.id, lines.join('\n'), opts);
+  } catch (error) {
+    console.error(error);
+    return send(msg.chat.id, 'Could not load PHV today summary.');
+  }
+}
+
+async function handlePhvWeek(msg, editContext = null) {
+  await ensureUser(msg);
+  try {
+    const start = todayDateString();
+    const sevenAgo = new Date(`${start}T12:00:00+08:00`);
+    sevenAgo.setDate(sevenAgo.getDate() - 6);
+    const startDate = sevenAgo.toISOString().slice(0, 10);
+    const logs = await getPhvRange(msg.from.id, startDate, todayDateString());
+    if (!logs.length) {
+      const text = 'No PHV logs in the past 7 days yet.';
+      return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
+    }
+    const s = summarizePhv(logs);
+    const bestDayMap = new Map();
+    logs.forEach((log) => {
+      const existing = bestDayMap.get(log.log_date) || { gross: 0, hours: 0, petrol: 0 };
+      existing.gross += Number(log.gross_amount || 0);
+      existing.hours += Number(log.hours_worked || 0);
+      existing.petrol += Number(log.petrol_cost || 0);
+      bestDayMap.set(log.log_date, existing);
+    });
+    let best = null;
+    for (const [date, data] of bestDayMap.entries()) {
+      const hourly = data.hours > 0 ? (data.gross - data.petrol) / data.hours : 0;
+      if (!best || hourly > best.hourly) best = { date, hourly };
+    }
+    const lines = [
+      '<b>PHV past 7 days</b>',
+      `Range: <b>${escapeHtml(startDate)}</b> to <b>${escapeHtml(todayDateString())}</b>`,
+      `Entries: <b>${logs.length}</b>`,
+      `Gross: <b>${escapeHtml(currency(s.gross))}</b>`,
+      `Petrol: <b>${escapeHtml(currency(s.petrol))}</b>`,
+      `Estimated net: <b>${escapeHtml(currency(s.net))}</b>`,
+      `Hours: <b>${escapeHtml(s.hours.toFixed(2))}</b>`,
+      `Avg hourly gross: <b>${escapeHtml(currency(s.hourlyGross))}</b>`,
+      `Avg hourly net: <b>${escapeHtml(currency(s.hourlyNet))}</b>`,
+    ];
+    if (best) lines.push(`Best day by hourly net: <b>${escapeHtml(best.date)}</b> (${escapeHtml(currency(best.hourly))}/hr)`);
+    const opts = { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '🗓 Weekly', callback_data: 'show:weekly' }]] } };
+    return editContext ? editOrSend(msg.chat.id, editContext.messageId, lines.join('\n'), opts) : send(msg.chat.id, lines.join('\n'), opts);
+  } catch (error) {
+    console.error(error);
+    return send(msg.chat.id, 'Could not load PHV week summary.');
+  }
+}
+
+async function handleDecide(msg, body) {
+  if (!body) return send(msg.chat.id, 'Use: <code>/decide your situation or question</code>');
+  await ensureUser(msg);
+  const advice = buildDecisionAdvice(body);
+
+  const { error } = await supabase.from('decision_logs').insert({
+    telegram_user_id: msg.from.id,
+    chat_id: msg.chat.id,
+    prompt: body,
+    recommendation: advice.recommendation,
+    risk_level: advice.risk,
+    created_at: nowIso(),
+  });
+  if (error) console.error('decision log save error', error);
+
+  const lines = [
+    '<b>Decision assistant</b>',
+    `<b>Your question</b>\n<blockquote>${escapeHtml(body)}</blockquote>`,
+    '',
+    `<b>Recommendation</b>\n• ${escapeHtml(advice.recommendation)}`,
+    '',
+    `<b>Risk level</b>\n• ${escapeHtml(advice.risk)}`,
+    '',
+    '<b>Why</b>',
+    ...advice.reasons.map((r) => `• ${escapeHtml(r)}`),
+    '',
+    '<b>Suggested next step</b>',
+    ...advice.actions.map((a) => `• ${escapeHtml(a)}`),
+  ];
+
+  await send(msg.chat.id, lines.join('\n'), { reply_markup: {
+    inline_keyboard: [
+      [
+        { text: '📅 Due', callback_data: 'show:due' },
+        { text: '🗓 Weekly', callback_data: 'show:weekly' },
+      ],
+    ],
+  }});
+}
+
+async function handleWeekly(msg, editContext = null) {
   await ensureUser(msg);
   const userId = msg.from.id;
   const today = todayDateString();
-  const sevenDaysAgo = new Date();
+  const sevenDaysAgo = new Date(`${today}T12:00:00+08:00`);
   sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
   const sevenIso = sevenDaysAgo.toISOString();
+  const startDate = sevenDaysAgo.toISOString().slice(0, 10);
 
-  const [notesRes, tasksRes, dueData, openTasks] = await Promise.all([
-    supabase
-      .from('notes')
-      .select('id', { count: 'exact', head: true })
-      .eq('telegram_user_id', userId)
-      .gte('created_at', sevenIso),
-    supabase
-      .from('tasks')
-      .select('*')
-      .eq('telegram_user_id', userId)
-      .gte('created_at', sevenIso),
+  const [notesRes, tasksRes, dueData, openTasks, phvLogs] = await Promise.all([
+    supabase.from('notes').select('id', { count: 'exact', head: true }).eq('telegram_user_id', userId).gte('created_at', sevenIso),
+    supabase.from('tasks').select('*').eq('telegram_user_id', userId).gte('created_at', sevenIso),
     getDueItems(userId),
     getOpenTasks(userId),
+    getPhvRange(userId, startDate, today),
   ]);
 
   if (notesRes.error || tasksRes.error) {
@@ -514,45 +946,101 @@ async function handleWeekly(msg) {
   const tasks = tasksRes.data || [];
   const doneCount = tasks.filter((t) => t.status === 'done').length;
   const openCount = tasks.filter((t) => t.status === 'open').length;
+  const phv = summarizePhv(phvLogs);
 
   const lines = [
     '<b>Weekly summary</b>',
     `Date: <b>${escapeHtml(today)}</b>`,
     '',
-    `<b>Captured this week</b>`,
-    `• Notes: ${notesRes.count || 0}`,
+    '<b>Capture</b>',
+    `• Notes / ideas saved: ${notesRes.count || 0}`,
     `• Tasks created: ${tasks.length}`,
     `• Tasks completed: ${doneCount}`,
     `• Tasks still open from this week: ${openCount}`,
     '',
-    `<b>Due now</b>`,
-    `• Reminders due: ${dueData.reminders.length}`,
+    '<b>Due / admin</b>',
+    `• Reminders due now: ${dueData.reminders.length}`,
     `• Admin items due / upcoming: ${dueData.adminItems.length}`,
+    '',
+    '<b>PHV</b>',
+    `• Gross past 7 days: ${escapeHtml(currency(phv.gross))}`,
+    `• Estimated net past 7 days: ${escapeHtml(currency(phv.net))}`,
+    `• Avg hourly net: ${escapeHtml(currency(phv.hourlyNet))}`,
     '',
     '<b>Top open tasks</b>',
   ];
 
-  if (openTasks.length) {
-    openTasks.slice(0, 5).forEach((t) => lines.push(`• ${escapeHtml(t.content)}`));
-  } else {
-    lines.push('• None');
-  }
+  if (openTasks.length) openTasks.slice(0, 5).forEach((t) => lines.push(`• ${escapeHtml(t.content)}`));
+  else lines.push('• None');
 
   lines.push('', '<b>Suggested next action</b>');
-  if (dueData.reminders.length || dueData.adminItems.length) {
-    lines.push('• Run through your due items first. Use /due');
-  } else if (openTasks.length) {
-    lines.push('• Clear one open task today.');
-  } else {
-    lines.push('• Capture anything new with /note or /task');
-  }
+  if (dueData.reminders.length || dueData.adminItems.length) lines.push('• Clear or review due items first with /due.');
+  else if (openTasks.length) lines.push('• Finish one open task today.');
+  else if (phvLogs.length) lines.push('• Review whether your best PHV hours are worth repeating next week.');
+  else lines.push('• Capture new ideas with note: or /note.');
 
-  await send(msg.chat.id, lines.join('\n'));
+  const opts = { reply_markup: { inline_keyboard: [[{ text: '📅 Due', callback_data: 'show:due' }, { text: '🚗 PHV Week', callback_data: 'show:phvweek' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, lines.join('\n'), opts) : send(msg.chat.id, lines.join('\n'), opts);
+}
+
+function parseNaturalLanguage(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return null;
+
+  let m;
+  if ((m = trimmed.match(/^note\s*:\s*(.+)$/i))) return { type: 'note', body: m[1].trim(), noteType: 'note' };
+  if ((m = trimmed.match(/^idea\s*:\s*(.+)$/i))) return { type: 'note', body: m[1].trim(), noteType: 'idea' };
+  if ((m = trimmed.match(/^task\s*:\s*(.+)$/i))) return { type: 'task', body: m[1].trim() };
+  if ((m = trimmed.match(/^done\s*:\s*(.+)$/i))) return { type: 'done', body: m[1].trim() };
+  if ((m = trimmed.match(/^search\s*:\s*(.+)$/i))) return { type: 'search', body: m[1].trim() };
+  if ((m = trimmed.match(/^decide\s*:\s*(.+)$/i))) return { type: 'decide', body: m[1].trim() };
+  if ((m = trimmed.match(/^admin\s*:\s*(.+)$/i))) return { type: 'adminadd', body: m[1].trim() };
+  if ((m = trimmed.match(/^admin done\s*:\s*(.+)$/i))) return { type: 'admindone', body: m[1].trim() };
+  if ((m = trimmed.match(/^phv\s*:\s*(.+)$/i))) return { type: 'phvlog', body: m[1].trim() };
+  if (/^due$/i.test(trimmed)) return { type: 'due' };
+  if (/^weekly$/i.test(trimmed)) return { type: 'weekly' };
+  if (/^phv today$/i.test(trimmed)) return { type: 'phvtoday' };
+  if (/^phv week$/i.test(trimmed)) return { type: 'phvweek' };
+  return null;
+}
+
+async function handleNaturalLanguage(msg, parsed) {
+  switch (parsed.type) {
+    case 'note':
+      return handleNote(msg, parsed.body, parsed.noteType || 'note');
+    case 'task':
+      return handleTask(msg, parsed.body);
+    case 'done':
+      return handleDone(msg, parsed.body);
+    case 'search':
+      return handleSearch(msg, parsed.body);
+    case 'decide':
+      return handleDecide(msg, parsed.body);
+    case 'adminadd':
+      return handleAdminAdd(msg, parsed.body);
+    case 'admindone':
+      return handleAdminDone(msg, parsed.body);
+    case 'due':
+      return handleDue(msg);
+    case 'weekly':
+      return handleWeekly(msg);
+    case 'phvlog':
+      return handlePhvLog(msg, parsed.body);
+    case 'phvtoday':
+      return handlePhvToday(msg);
+    case 'phvweek':
+      return handlePhvWeek(msg);
+    default:
+      return send(msg.chat.id, 'Unknown input. Use /help');
+  }
 }
 
 async function routeMessage(msg) {
   if (!msg.text) return;
   const text = msg.text.trim();
+  const natural = parseNaturalLanguage(text);
+  if (!text.startsWith('/') && natural) return handleNaturalLanguage(msg, natural);
+
   const [command, ...rest] = text.split(' ');
   const body = rest.join(' ').trim();
 
@@ -563,7 +1051,9 @@ async function routeMessage(msg) {
     case '/menu':
       return showHelp(msg.chat.id);
     case '/note':
-      return handleNote(msg, body);
+      return handleNote(msg, body, 'note');
+    case '/idea':
+      return handleNote(msg, body, 'idea');
     case '/task':
       return handleTask(msg, body);
     case '/done':
@@ -572,14 +1062,78 @@ async function routeMessage(msg) {
       return handleRemind(msg, body);
     case '/adminadd':
       return handleAdminAdd(msg, body);
+    case '/admindone':
+      return handleAdminDone(msg, body);
     case '/due':
       return handleDue(msg);
     case '/search':
       return handleSearch(msg, body);
     case '/weekly':
       return handleWeekly(msg);
+    case '/phvlog':
+      return handlePhvLog(msg, body);
+    case '/phvtoday':
+      return handlePhvToday(msg);
+    case '/phvweek':
+      return handlePhvWeek(msg);
+    case '/decide':
+      return handleDecide(msg, body);
     default:
-      return send(msg.chat.id, 'Unknown command. Use /help');
+      return send(msg.chat.id, 'Unknown command. Use /help', { reply_markup: MAIN_KEYBOARD });
+  }
+}
+
+async function routeCallback(query) {
+  const data = query.data || '';
+  const msg = query.message;
+  if (!msg) return answerCallback(query.id);
+
+  const fauxMsg = { chat: msg.chat, from: query.from, text: '', message_id: msg.message_id };
+
+  try {
+    if (data === 'show:menu') {
+      await answerCallback(query.id);
+      return editOrSend(msg.chat.id, msg.message_id, 'Choose an action.', { reply_markup: MAIN_KEYBOARD });
+    }
+    if (data === 'show:due') {
+      await answerCallback(query.id);
+      return handleDue(fauxMsg, { messageId: msg.message_id });
+    }
+    if (data === 'show:weekly') {
+      await answerCallback(query.id);
+      return handleWeekly(fauxMsg, { messageId: msg.message_id });
+    }
+    if (data === 'show:phvtoday') {
+      await answerCallback(query.id);
+      return handlePhvToday(fauxMsg, { messageId: msg.message_id });
+    }
+    if (data === 'show:phvweek') {
+      await answerCallback(query.id);
+      return handlePhvWeek(fauxMsg, { messageId: msg.message_id });
+    }
+    if (data.startsWith('hint:')) {
+      const hint = data.split(':')[1];
+      await answerCallback(query.id);
+      const hints = {
+        note: 'Send: <code>note: your note here</code> or <code>/note your note here</code>',
+        task: 'Send: <code>task: your task here</code> or <code>/task your task here</code>',
+        decide: 'Send: <code>decide: should I service now or wait?</code> or <code>/decide ...</code>',
+      };
+      return send(msg.chat.id, hints[hint] || 'Use /help', { reply_markup: MAIN_KEYBOARD });
+    }
+    if (data.startsWith('admindone:')) {
+      const id = data.split(':')[1];
+      await answerCallback(query.id, 'Marking as done...');
+      const { data: row, error } = await supabase.from('admin_items').select('*').eq('id', id).limit(1).maybeSingle();
+      if (error) throw error;
+      await completeAdminItemByRow(msg.chat.id, row);
+      return handleDue(fauxMsg, { messageId: msg.message_id });
+    }
+    await answerCallback(query.id);
+  } catch (error) {
+    console.error('Callback handler error', error);
+    await answerCallback(query.id, 'Something went wrong.');
+    return send(msg.chat.id, 'Something went wrong while handling that button.');
   }
 }
 
@@ -612,6 +1166,10 @@ bot.on('message', async (msg) => {
       console.error('Fallback send error', inner);
     }
   }
+});
+
+bot.on('callback_query', async (query) => {
+  await routeCallback(query);
 });
 
 async function start() {
