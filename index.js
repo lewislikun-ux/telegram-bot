@@ -43,8 +43,13 @@ const MAIN_KEYBOARD = {
       { text: '🚗 PHV Today', callback_data: 'show:phvtoday' },
       { text: '🧠 Decide', callback_data: 'hint:decide' },
     ],
+    [
+      { text: '⛽ PHV Settings', callback_data: 'show:phvsettings' },
+    ],
   ],
 };
+
+const pendingPhvSettingInputs = new Map();
 
 function escapeHtml(text = '') {
   return String(text)
@@ -210,6 +215,145 @@ function currency(n) {
   return `$${Number(n).toFixed(2)}`;
 }
 
+
+async function getOrCreatePhvSettings(msgOrUser) {
+  const telegramUserId = msgOrUser.from ? msgOrUser.from.id : msgOrUser.telegram_user_id;
+  const chatId = msgOrUser.chat ? msgOrUser.chat.id : msgOrUser.chat_id;
+
+  const { data: existing, error } = await supabase
+    .from('phv_settings')
+    .select('*')
+    .eq('telegram_user_id', telegramUserId)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (existing) return existing;
+
+  const defaults = {
+    telegram_user_id: telegramUserId,
+    chat_id: chatId,
+    mode: 'simple',
+    fuel_consumption_kmpl: 15.3,
+    petrol_price_per_litre: 3.46,
+    discount_percent: 27,
+    fixed_rebate: 3,
+    rebate_threshold: 60,
+    cost_per_km_override: 0.16,
+    updated_at: nowIso(),
+  };
+
+  const { data: created, error: insertErr } = await supabase
+    .from('phv_settings')
+    .upsert(defaults, { onConflict: 'telegram_user_id' })
+    .select('*')
+    .single();
+
+  if (insertErr) throw insertErr;
+  return created;
+}
+
+function calculateEffectivePetrolPrice(settings) {
+  const basePrice = Number(settings.petrol_price_per_litre || 0);
+  const discountPercent = Number(settings.discount_percent || 0);
+  const fixedRebate = Number(settings.fixed_rebate || 0);
+  const rebateThreshold = Number(settings.rebate_threshold || 0);
+  if (!(basePrice > 0)) return 0;
+
+  const discountedPrice = basePrice * (1 - (discountPercent / 100));
+  if (!(fixedRebate > 0) || !(rebateThreshold > 0) || !(basePrice > 0)) return discountedPrice;
+
+  const litresAtThreshold = rebateThreshold / basePrice;
+  if (!(litresAtThreshold > 0)) return discountedPrice;
+  const discountedTotal = discountedPrice * litresAtThreshold;
+  const finalTotal = Math.max(discountedTotal - fixedRebate, 0);
+  return finalTotal / litresAtThreshold;
+}
+
+function calculateAutoCostPerKm(settings) {
+  const kmpl = Number(settings.fuel_consumption_kmpl || 0);
+  if (!(kmpl > 0)) return 0;
+  const effectivePrice = calculateEffectivePetrolPrice(settings);
+  return effectivePrice / kmpl;
+}
+
+function calculatePhvPetrolCost(kmDriven, settings) {
+  const km = Number(kmDriven || 0);
+  if (!(km > 0)) return null;
+  const mode = String(settings.mode || 'simple');
+  let costPerKm = null;
+
+  if (mode === 'simple') {
+    const override = Number(settings.cost_per_km_override || 0);
+    costPerKm = override > 0 ? override : calculateAutoCostPerKm(settings);
+  } else {
+    costPerKm = calculateAutoCostPerKm(settings);
+  }
+
+  if (!(costPerKm > 0)) return null;
+  return Number((km * costPerKm).toFixed(2));
+}
+
+function phvSettingsText(settings) {
+  const effectivePrice = calculateEffectivePetrolPrice(settings);
+  const autoCostKm = calculateAutoCostPerKm(settings);
+  const modeLabel = settings.mode === 'auto' ? 'Auto calculation' : 'Simple fixed cost/km';
+  return [
+    '<b>PHV settings</b>',
+    `Mode: <b>${escapeHtml(modeLabel)}</b>`,
+    '',
+    `Fuel consumption: <b>${escapeHtml(Number(settings.fuel_consumption_kmpl || 0).toFixed(2))} km/L</b>`,
+    `Petrol price: <b>${escapeHtml(currency(settings.petrol_price_per_litre))}/L</b>`,
+    `Discount: <b>${escapeHtml(String(Number(settings.discount_percent || 0).toFixed(2)))}%</b>`,
+    `Fixed rebate: <b>${escapeHtml(currency(settings.fixed_rebate))}</b> off <b>${escapeHtml(currency(settings.rebate_threshold))}</b>`,
+    `Effective petrol price: <b>${escapeHtml(currency(effectivePrice))}/L</b>`,
+    `Auto cost/km: <b>${escapeHtml(currency(autoCostKm))}</b>`,
+    `Simple cost/km override: <b>${escapeHtml(currency(settings.cost_per_km_override))}</b>`,
+    '',
+    'When you log PHV without petrol, the bot auto-fills petrol using the current mode.',
+  ].join('\n');
+}
+
+function phvSettingsButtons(settings) {
+  const modeText = settings.mode === 'auto' ? 'Switch to Simple mode' : 'Switch to Auto mode';
+  return {
+    inline_keyboard: [
+      [
+        { text: modeText, callback_data: 'phvset:togglemode' },
+      ],
+      [
+        { text: 'Edit Fuel Consumption', callback_data: 'phvset:edit:fuel_consumption_kmpl' },
+        { text: 'Edit Petrol Price', callback_data: 'phvset:edit:petrol_price_per_litre' },
+      ],
+      [
+        { text: 'Edit Discount %', callback_data: 'phvset:edit:discount_percent' },
+        { text: 'Edit Rebate', callback_data: 'phvset:edit:fixed_rebate' },
+      ],
+      [
+        { text: 'Edit Rebate Threshold', callback_data: 'phvset:edit:rebate_threshold' },
+        { text: 'Edit Cost/km Override', callback_data: 'phvset:edit:cost_per_km_override' },
+      ],
+      [
+        { text: '🔄 Refresh', callback_data: 'show:phvsettings' },
+        { text: '➕ Menu', callback_data: 'show:menu' },
+      ],
+    ],
+  };
+}
+
+function phvSettingPrompt(field) {
+  const prompts = {
+    fuel_consumption_kmpl: 'Send the new fuel consumption in km/L. Example: <code>15.3</code>',
+    petrol_price_per_litre: 'Send the new petrol price per litre. Example: <code>3.46</code>',
+    discount_percent: 'Send the new discount percent. Example: <code>27</code>',
+    fixed_rebate: 'Send the fixed rebate amount. Example: <code>3</code>',
+    rebate_threshold: 'Send the rebate threshold spend amount. Example: <code>60</code>',
+    cost_per_km_override: 'Send the simple cost per km override. Example: <code>0.16</code>',
+  };
+  return prompts[field] || 'Send the new numeric value.';
+}
+
+
 function phvComputed(log) {
   const gross = Number(log.gross_amount || 0);
   const petrol = Number(log.petrol_cost || 0);
@@ -352,6 +496,7 @@ async function showHelp(chatId) {
     '/phvlog date:2026-03-27 | gross:145 | hours:2.5 | km:68 | petrol:18',
     '/phvtoday',
     '/phvweek',
+    '/phvsettings',
     '/decide your question',
     '',
     '<b>Natural language examples</b>',
@@ -764,12 +909,42 @@ function summarizePhv(logs) {
   return totals;
 }
 
+
+async function handlePhvSettings(msg, editContext = null) {
+  await ensureUser(msg);
+  try {
+    const settings = await getOrCreatePhvSettings(msg);
+    const text = phvSettingsText(settings);
+    const opts = { reply_markup: phvSettingsButtons(settings) };
+    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, opts) : send(msg.chat.id, text, opts);
+  } catch (error) {
+    console.error(error);
+    return send(msg.chat.id, 'Could not load PHV settings.');
+  }
+}
+
 async function handlePhvLog(msg, body) {
   const parsed = parsePhvBody(body);
   if (!parsed) {
     return send(msg.chat.id, 'Use: <code>/phvlog date:2026-03-27 | gross:145 | hours:2.5 | km:68 | petrol:18 | notes:airport run</code>');
   }
   await ensureUser(msg);
+
+  let settings = null;
+  let autoPetrolUsed = false;
+  try {
+    settings = await getOrCreatePhvSettings(msg);
+  } catch (settingsError) {
+    console.error('phv settings load error', settingsError);
+  }
+
+  if ((parsed.petrol_cost === null || parsed.petrol_cost === undefined) && parsed.km_driven !== null && settings) {
+    const autoPetrol = calculatePhvPetrolCost(parsed.km_driven, settings);
+    if (autoPetrol !== null) {
+      parsed.petrol_cost = autoPetrol;
+      autoPetrolUsed = true;
+    }
+  }
 
   const { error } = await supabase.from('phv_logs').insert({
     telegram_user_id: msg.from.id,
@@ -796,6 +971,7 @@ async function handlePhvLog(msg, body) {
   ];
   if (parsed.km_driven !== null) lines.push(`KM: <b>${escapeHtml(String(parsed.km_driven))}</b>`);
   if (parsed.petrol_cost !== null) lines.push(`Petrol: <b>${escapeHtml(currency(parsed.petrol_cost))}</b>`);
+  if (autoPetrolUsed) lines.push(`Petrol source: <b>auto-filled from PHV settings (${escapeHtml(settings.mode || 'simple')} mode)</b>`);
 
   await send(msg.chat.id, lines.join('\n'), { reply_markup: {
     inline_keyboard: [
@@ -1001,6 +1177,7 @@ function parseNaturalLanguage(text) {
   if (/^weekly$/i.test(trimmed)) return { type: 'weekly' };
   if (/^phv today$/i.test(trimmed)) return { type: 'phvtoday' };
   if (/^phv week$/i.test(trimmed)) return { type: 'phvweek' };
+  if (/^phv settings$/i.test(trimmed)) return { type: 'phvsettings' };
   return null;
 }
 
@@ -1030,6 +1207,8 @@ async function handleNaturalLanguage(msg, parsed) {
       return handlePhvToday(msg);
     case 'phvweek':
       return handlePhvWeek(msg);
+    case 'phvsettings':
+      return handlePhvSettings(msg);
     default:
       return send(msg.chat.id, 'Unknown input. Use /help');
   }
@@ -1038,6 +1217,33 @@ async function handleNaturalLanguage(msg, parsed) {
 async function routeMessage(msg) {
   if (!msg.text) return;
   const text = msg.text.trim();
+
+  const pending = pendingPhvSettingInputs.get(msg.from.id);
+  if (pending && !text.startsWith('/')) {
+    const value = Number(text.replace(/[^0-9.\-]/g, ''));
+    if (!Number.isFinite(value)) {
+      return send(msg.chat.id, 'Please send a number only. Example: <code>3.46</code>');
+    }
+
+    const updates = { updated_at: nowIso() };
+    updates[pending.field] = value;
+
+    const { error } = await supabase
+      .from('phv_settings')
+      .update(updates)
+      .eq('telegram_user_id', msg.from.id);
+
+    pendingPhvSettingInputs.delete(msg.from.id);
+
+    if (error) {
+      console.error(error);
+      return send(msg.chat.id, 'Could not update that PHV setting.');
+    }
+
+    await send(msg.chat.id, `Updated <b>${escapeHtml(pending.field)}</b> to <b>${escapeHtml(String(value))}</b>.`);
+    return handlePhvSettings(msg);
+  }
+
   const natural = parseNaturalLanguage(text);
   if (!text.startsWith('/') && natural) return handleNaturalLanguage(msg, natural);
 
@@ -1076,6 +1282,8 @@ async function routeMessage(msg) {
       return handlePhvToday(msg);
     case '/phvweek':
       return handlePhvWeek(msg);
+    case '/phvsettings':
+      return handlePhvSettings(msg);
     case '/decide':
       return handleDecide(msg, body);
     default:
@@ -1110,6 +1318,24 @@ async function routeCallback(query) {
     if (data === 'show:phvweek') {
       await answerCallback(query.id);
       return handlePhvWeek(fauxMsg, { messageId: msg.message_id });
+    }
+    if (data === 'show:phvsettings') {
+      await answerCallback(query.id);
+      return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
+    }
+    if (data.startsWith('phvset:togglemode')) {
+      await answerCallback(query.id, 'Switching mode...');
+      const settings = await getOrCreatePhvSettings(fauxMsg);
+      const nextMode = settings.mode === 'auto' ? 'simple' : 'auto';
+      const { error } = await supabase.from('phv_settings').update({ mode: nextMode, updated_at: nowIso() }).eq('telegram_user_id', query.from.id);
+      if (error) throw error;
+      return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
+    }
+    if (data.startsWith('phvset:edit:')) {
+      const field = data.split(':')[2];
+      pendingPhvSettingInputs.set(query.from.id, { field });
+      await answerCallback(query.id, 'Waiting for your value...');
+      return send(msg.chat.id, phvSettingPrompt(field), { reply_markup: phvSettingsButtons(await getOrCreatePhvSettings(fauxMsg)) });
     }
     if (data.startsWith('hint:')) {
       const hint = data.split(':')[1];
