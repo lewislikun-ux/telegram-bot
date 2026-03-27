@@ -1460,6 +1460,10 @@ async function routeCallback(query) {
       await answerCallback(query.id);
       return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
     }
+    if (data === 'show:shoulddrive') {
+      await answerCallback(query.id);
+      return handleShouldDrive(fauxMsg);
+    }
     if (data.startsWith('phvset:togglemode')) {
       await answerCallback(query.id, 'Switching mode...');
       const settings = await getOrCreatePhvSettings(fauxMsg);
