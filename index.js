@@ -41,10 +41,11 @@ const MAIN_KEYBOARD = {
     ],
     [
       { text: '🚗 PHV Today', callback_data: 'show:phvtoday' },
-      { text: '🧠 Decide', callback_data: 'hint:decide' },
+      { text: '❓ Drive?', callback_data: 'show:shoulddrive' },
     ],
     [
       { text: '⛽ PHV Settings', callback_data: 'show:phvsettings' },
+      { text: '🧠 Decide', callback_data: 'hint:decide' },
     ],
   ],
 };
@@ -364,6 +365,89 @@ function phvComputed(log) {
   return { net, hourlyGross, hourlyNet };
 }
 
+
+function getDayType(dateString) {
+  const d = new Date(`${String(dateString).slice(0, 10)}T12:00:00+08:00`);
+  const day = d.getDay();
+  return day === 0 || day === 6 ? 'weekend' : 'weekday';
+}
+
+function expectedSessionHours(dateString) {
+  return getDayType(dateString) === 'weekend' ? 6 : 4;
+}
+
+function scoreSession(hourlyNet) {
+  const value = Number(hourlyNet || 0);
+  if (value >= 50) return { label: 'Excellent', emoji: '🟢', color: 'excellent' };
+  if (value >= 35) return { label: 'Average', emoji: '🟡', color: 'average' };
+  return { label: 'Poor', emoji: '🔴', color: 'poor' };
+}
+
+function summarizeComparableSessions(logs, dayType, excludeDate = null) {
+  const filtered = (logs || []).filter((log) => getDayType(log.log_date) === dayType && (!excludeDate || log.log_date !== excludeDate));
+  const summary = summarizePhv(filtered);
+  summary.count = filtered.length;
+  summary.logs = filtered;
+  return summary;
+}
+
+function buildStopRecommendation(log, comparableSummary) {
+  const c = phvComputed(log);
+  const hours = Number(log.hours_worked || 0);
+  const maxHours = expectedSessionHours(log.log_date);
+  const pct = maxHours > 0 ? hours / maxHours : 0;
+  const benchmark = comparableSummary && comparableSummary.count ? Number(comparableSummary.hourlyNet || 0) : 0;
+  const softFloor = benchmark > 0 ? Math.max(35, benchmark * 0.85) : 35;
+  const hardFloor = benchmark > 0 ? Math.max(30, benchmark * 0.75) : 30;
+
+  if (hours >= maxHours) {
+    return 'You are already at or beyond your usual session window. Stopping is reasonable unless demand is clearly strong.';
+  }
+  if (pct >= 0.75 && c.hourlyNet < hardFloor) {
+    return 'Hourly net is low relative to your usual range and you are already late into the session. Consider stopping soon.';
+  }
+  if (pct >= 0.5 && c.hourlyNet < softFloor) {
+    return 'This session is running below your normal pace. If the next 30 minutes stay weak, consider stopping.';
+  }
+  if (c.hourlyNet >= Math.max(45, benchmark)) {
+    return 'This session is still healthy for your fixed hours. Continue if you feel alert.';
+  }
+  return 'Borderline session. Reassess after the next block of driving instead of forcing more low-value time.';
+}
+
+function buildShouldDriveAdvice(dateString, comparableSummary) {
+  const dayType = getDayType(dateString);
+  if (!comparableSummary || comparableSummary.count === 0) {
+    return {
+      headline: `No recent ${dayType} data yet`,
+      recommendation: 'Go only if you already planned to. Build 3 to 5 logs first for a useful read.',
+      confidence: 'low',
+    };
+  }
+
+  const hourly = Number(comparableSummary.hourlyNet || 0);
+  let headline = `Based on your recent ${dayType} sessions`;
+  let recommendation = 'Neutral.';
+  let confidence = comparableSummary.count >= 5 ? 'medium' : 'low';
+
+  if (hourly >= 45) {
+    recommendation = 'Worth going. Your recent sessions have been strong enough to justify the trip.';
+    confidence = comparableSummary.count >= 5 ? 'high' : 'medium';
+  } else if (hourly >= 35) {
+    recommendation = 'Reasonable to go, but keep expectations moderate and protect your stop time discipline.';
+  } else {
+    recommendation = 'Recent returns have been weak. Only go if you have another reason or expect conditions to be unusually good.';
+  }
+
+  return { headline, recommendation, confidence };
+}
+
+function compareWeekdayWeekend(logs) {
+  const weekday = summarizeComparableSessions(logs, 'weekday');
+  const weekend = summarizeComparableSessions(logs, 'weekend');
+  return { weekday, weekend };
+}
+
 function buildDecisionAdvice(input) {
   const text = String(input || '').trim();
   const lower = text.toLowerCase();
@@ -497,6 +581,7 @@ async function showHelp(chatId) {
     '/phvtoday',
     '/phvweek',
     '/phvsettings',
+    '/shoulddrive',
     '/decide your question',
     '',
     '<b>Natural language examples</b>',
@@ -992,6 +1077,7 @@ async function handlePhvToday(msg, editContext = null) {
       return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
     }
     const s = summarizePhv(logs);
+    const score = scoreSession(s.hourlyNet);
     const lines = [
       '<b>PHV today</b>',
       `Date: <b>${escapeHtml(todayDateString())}</b>`,
@@ -1002,8 +1088,10 @@ async function handlePhvToday(msg, editContext = null) {
       `Hours: <b>${escapeHtml(s.hours.toFixed(2))}</b>`,
       `Hourly gross: <b>${escapeHtml(currency(s.hourlyGross))}</b>`,
       `Hourly net: <b>${escapeHtml(currency(s.hourlyNet))}</b>`,
+      `Score: <b>${escapeHtml(score.emoji + ' ' + score.label)}</b>`,
+      `Stop / continue: <b>${escapeHtml(buildStopRecommendation({ log_date: todayDateString(), hours_worked: s.hours, gross_amount: s.gross, petrol_cost: s.petrol }, summarizeComparableSessions(await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString()), getDayType(todayDateString()), todayDateString())).replace(/<[^>]+>/g,''))}</b>`,
     ];
-    const opts = { reply_markup: { inline_keyboard: [[{ text: '📈 PHV Week', callback_data: 'show:phvweek' }, { text: '📅 Due', callback_data: 'show:due' }]] } };
+    const opts = { reply_markup: { inline_keyboard: [[{ text: '📈 PHV Week', callback_data: 'show:phvweek' }, { text: '❓ Should I Drive', callback_data: 'show:shoulddrive' }], [{ text: '📅 Due', callback_data: 'show:due' }]] } };
     return editContext ? editOrSend(msg.chat.id, editContext.messageId, lines.join('\n'), opts) : send(msg.chat.id, lines.join('\n'), opts);
   } catch (error) {
     console.error(error);
@@ -1037,6 +1125,8 @@ async function handlePhvWeek(msg, editContext = null) {
       const hourly = data.hours > 0 ? (data.gross - data.petrol) / data.hours : 0;
       if (!best || hourly > best.hourly) best = { date, hourly };
     }
+    const score = scoreSession(s.hourlyNet);
+    const split = compareWeekdayWeekend(logs);
     const lines = [
       '<b>PHV past 7 days</b>',
       `Range: <b>${escapeHtml(startDate)}</b> to <b>${escapeHtml(todayDateString())}</b>`,
@@ -1047,13 +1137,55 @@ async function handlePhvWeek(msg, editContext = null) {
       `Hours: <b>${escapeHtml(s.hours.toFixed(2))}</b>`,
       `Avg hourly gross: <b>${escapeHtml(currency(s.hourlyGross))}</b>`,
       `Avg hourly net: <b>${escapeHtml(currency(s.hourlyNet))}</b>`,
+      `Overall score: <b>${escapeHtml(score.emoji + ' ' + score.label)}</b>`,
     ];
     if (best) lines.push(`Best day by hourly net: <b>${escapeHtml(best.date)}</b> (${escapeHtml(currency(best.hourly))}/hr)`);
-    const opts = { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '🗓 Weekly', callback_data: 'show:weekly' }]] } };
+    lines.push('', '<b>Weekday vs weekend</b>');
+    lines.push(`• Weekday avg hourly net: <b>${escapeHtml(currency(split.weekday.hourlyNet || 0))}</b> from <b>${escapeHtml(String(split.weekday.count || 0))}</b> log(s)`);
+    lines.push(`• Weekend avg hourly net: <b>${escapeHtml(currency(split.weekend.hourlyNet || 0))}</b> from <b>${escapeHtml(String(split.weekend.count || 0))}</b> log(s)`);
+    lines.push('', '<b>Interpretation</b>');
+    if ((split.weekday.count || 0) && (split.weekend.count || 0)) {
+      const better = Number(split.weekday.hourlyNet || 0) >= Number(split.weekend.hourlyNet || 0) ? 'Weekday sessions are currently stronger.' : 'Weekend sessions are currently stronger.';
+      lines.push(`• ${escapeHtml(better)}`);
+    } else {
+      lines.push('• Need more logs from both weekday and weekend to compare properly.');
+    }
+    const opts = { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '❓ Should I Drive', callback_data: 'show:shoulddrive' }], [{ text: '🗓 Weekly', callback_data: 'show:weekly' }]] } };
     return editContext ? editOrSend(msg.chat.id, editContext.messageId, lines.join('\n'), opts) : send(msg.chat.id, lines.join('\n'), opts);
   } catch (error) {
     console.error(error);
     return send(msg.chat.id, 'Could not load PHV week summary.');
+  }
+}
+
+
+async function handleShouldDrive(msg, editContext = null) {
+  await ensureUser(msg);
+  try {
+    const start = addYears(todayDateString(), -1);
+    const logs = await getPhvRange(msg.from.id, start, todayDateString());
+    const dayType = getDayType(todayDateString());
+    const comparable = summarizeComparableSessions(logs, dayType, todayDateString());
+    const advice = buildShouldDriveAdvice(todayDateString(), comparable);
+    const lines = [
+      '<b>Should I drive today?</b>',
+      `Today type: <b>${escapeHtml(dayType)}</b>`,
+      `Comparable sessions used: <b>${escapeHtml(String(comparable.count || 0))}</b>`,
+      `Recent avg hourly net: <b>${escapeHtml(currency(comparable.hourlyNet || 0))}</b>`,
+      '',
+      `<b>${escapeHtml(advice.headline)}</b>`,
+      `• ${escapeHtml(advice.recommendation)}`,
+      `• Confidence: <b>${escapeHtml(advice.confidence)}</b>`,
+    ];
+    if (comparable.count > 0) {
+      lines.push(`• Recent avg net per session: <b>${escapeHtml(currency((comparable.net || 0) / comparable.count))}</b>`);
+      lines.push(`• Recent avg hours per session: <b>${escapeHtml(((comparable.hours || 0) / comparable.count).toFixed(2))}</b>`);
+    }
+    const opts = { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
+    return editContext ? editOrSend(msg.chat.id, editContext.messageId, lines.join('\n'), opts) : send(msg.chat.id, lines.join('\n'), opts);
+  } catch (error) {
+    console.error(error);
+    return send(msg.chat.id, 'Could not load should-drive insight.');
   }
 }
 
@@ -1152,7 +1284,7 @@ async function handleWeekly(msg, editContext = null) {
   lines.push('', '<b>Suggested next action</b>');
   if (dueData.reminders.length || dueData.adminItems.length) lines.push('• Clear or review due items first with /due.');
   else if (openTasks.length) lines.push('• Finish one open task today.');
-  else if (phvLogs.length) lines.push('• Review whether your best PHV hours are worth repeating next week.');
+  else if (phvLogs.length) lines.push('• Review PHV score and stop signals to protect your hourly net.');
   else lines.push('• Capture new ideas with note: or /note.');
 
   const opts = { reply_markup: { inline_keyboard: [[{ text: '📅 Due', callback_data: 'show:due' }, { text: '🚗 PHV Week', callback_data: 'show:phvweek' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
@@ -1178,6 +1310,7 @@ function parseNaturalLanguage(text) {
   if (/^phv today$/i.test(trimmed)) return { type: 'phvtoday' };
   if (/^phv week$/i.test(trimmed)) return { type: 'phvweek' };
   if (/^phv settings$/i.test(trimmed)) return { type: 'phvsettings' };
+  if (/^(should i drive|drive today\??)$/i.test(trimmed)) return { type: 'shoulddrive' };
   return null;
 }
 
@@ -1209,6 +1342,8 @@ async function handleNaturalLanguage(msg, parsed) {
       return handlePhvWeek(msg);
     case 'phvsettings':
       return handlePhvSettings(msg);
+    case 'shoulddrive':
+      return handleShouldDrive(msg);
     default:
       return send(msg.chat.id, 'Unknown input. Use /help');
   }
@@ -1284,6 +1419,8 @@ async function routeMessage(msg) {
       return handlePhvWeek(msg);
     case '/phvsettings':
       return handlePhvSettings(msg);
+    case '/shoulddrive':
+      return handleShouldDrive(msg);
     case '/decide':
       return handleDecide(msg, body);
     default:
