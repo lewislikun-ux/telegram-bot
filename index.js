@@ -103,6 +103,48 @@ function formatDateTime(value) {
   return `${sg.getFullYear()}-${String(sg.getMonth() + 1).padStart(2, '0')}-${String(sg.getDate()).padStart(2, '0')} ${String(sg.getHours()).padStart(2, '0')}:${String(sg.getMinutes()).padStart(2, '0')}`;
 }
 
+function telegramMessageIso(msg) {
+  const unix = Number(msg?.date || 0);
+  if (!unix) return nowIso();
+  return new Date(unix * 1000).toISOString();
+}
+function durationHoursBetween(startIso, endIso) {
+  const start = new Date(startIso);
+  const end = new Date(endIso);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+  const hours = (end - start) / 3600000;
+  return hours > 0 ? hours : null;
+}
+function formatDurationHours(hours) {
+  const h = Number(hours);
+  if (!Number.isFinite(h) || h <= 0) return '-';
+  const totalMinutes = Math.round(h * 60);
+  const wholeHours = Math.floor(totalMinutes / 60);
+  const mins = totalMinutes % 60;
+  if (wholeHours <= 0) return `${mins}m`;
+  if (mins === 0) return `${wholeHours}h`;
+  return `${wholeHours}h ${mins}m`;
+}
+function buildMaintenanceWatchList(items, odometer, thresholdKm = 1000) {
+  const currentOdo = Number(odometer);
+  if (!Number.isFinite(currentOdo)) return [];
+  return (items || [])
+    .map((item) => ({ ...item, remaining: Number(item.next_due_mileage) - currentOdo }))
+    .filter((x) => Number.isFinite(x.remaining) && x.remaining <= thresholdKm)
+    .sort((a, b) => a.remaining - b.remaining);
+}
+function maintenanceWatchLines(items, odometer, thresholdKm = 1000, maxItems = 3) {
+  const watch = buildMaintenanceWatchList(items, odometer, thresholdKm).slice(0, maxItems);
+  if (!watch.length) return [];
+  const lines = ['', '<b>Maintenance watch</b>'];
+  watch.forEach((item) => {
+    const rem = Number(item.remaining);
+    const text = rem < 0 ? `${Math.abs(rem)} km overdue` : `${Math.round(rem)} km remaining`;
+    lines.push(`• ${escapeHtml(item.item_name)} — due at <b>${escapeHtml(String(item.next_due_mileage))}</b> (${escapeHtml(text)})`);
+  });
+  return lines;
+}
+
 const MAIN_KEYBOARD = {
   inline_keyboard: [
     [
@@ -330,11 +372,11 @@ function parsePhvNowBody(body) {
     if (m) result[m[1].toLowerCase()] = m[2].trim();
   }
   const gross = parseFloat(result.gross || '');
-  const hours = parseFloat(result.hours || '');
+  const hours = result.hours !== undefined ? parseFloat(result.hours || '') : null;
   const currentMileage = parseFloat(result.current || result.mileage || '');
   const petrol = result.petrol !== undefined ? parseFloat(result.petrol) : null;
-  if (!Number.isFinite(gross) || !Number.isFinite(hours) || !Number.isFinite(currentMileage)) return null;
-  return { gross_amount: gross, hours_worked: hours, current_mileage: currentMileage, petrol_cost: Number.isFinite(petrol) ? petrol : null };
+  if (!Number.isFinite(gross) || !Number.isFinite(currentMileage)) return null;
+  return { gross_amount: gross, hours_worked: Number.isFinite(hours) ? hours : null, current_mileage: currentMileage, petrol_cost: Number.isFinite(petrol) ? petrol : null };
 }
 function parsePhvEnd(body) {
   const parts = String(body || '').split('|').map((s) => s.trim()).filter(Boolean);
@@ -347,12 +389,12 @@ function parsePhvEnd(body) {
   }
   const endMileage = first ?? parseFloat(result.end || '');
   const gross = parseFloat(result.gross || '');
-  const hours = parseFloat(result.hours || '');
+  const hours = result.hours !== undefined ? parseFloat(result.hours || '') : null;
   const petrol = result.petrol !== undefined ? parseFloat(result.petrol) : null;
   const date = result.date || todayDateString();
   const notes = result.note || result.notes || null;
-  if (!Number.isFinite(endMileage) || !Number.isFinite(gross) || !Number.isFinite(hours)) return null;
-  return { end_mileage: endMileage, gross_amount: gross, hours_worked: hours, petrol_cost: Number.isFinite(petrol) ? petrol : null, log_date: date, notes };
+  if (!Number.isFinite(endMileage) || !Number.isFinite(gross)) return null;
+  return { end_mileage: endMileage, gross_amount: gross, hours_worked: Number.isFinite(hours) ? hours : null, petrol_cost: Number.isFinite(petrol) ? petrol : null, log_date: date, notes };
 }
 function parseMaintenanceAdd(body) {
   const parts = String(body || '').split('|').map((s) => s.trim());
@@ -502,8 +544,8 @@ async function handleStart(msg) {
     '',
     'Try:',
     '<code>/phvstart 112280</code>',
-    '<code>/phvnow gross:62 | hours:1.8 | current:112314</code>',
-    '<code>/phvend 112348 | gross:145 | hours:2.5</code>',
+    '<code>/phvnow gross:62 | current:112314</code>',
+    '<code>/phvend 112348 | gross:145</code>',
     '<code>/addmaintenance engine servicing | 8000 | 112000</code>',
     '<code>/phvsettings</code>',
   ].join('\n'), { reply_markup: MAIN_KEYBOARD });
@@ -528,8 +570,8 @@ async function showHelp(chatId) {
     '<b>PHV</b>',
     '<code>/phvlog date:2026-03-27 | gross:145 | hours:2.5 | km:68</code>',
     '<code>/phvstart 112280</code>',
-    '<code>/phvnow gross:62 | hours:1.8 | current:112314</code>',
-    '<code>/phvend 112348 | gross:145 | hours:2.5</code>',
+    '<code>/phvnow gross:62 | current:112314</code>',
+    '<code>/phvend 112348 | gross:145</code>',
     '<code>/phvtoday</code>',
     '<code>/phvweek</code>',
     '<code>/shoulddrive</code>',
@@ -703,39 +745,56 @@ async function handlePhvStart(msg, body = '') {
   if (existing) return send(msg.chat.id, `You already have an active PHV session.\nStart mileage: <b>${num(existing.start_mileage, 0)}</b>\nStarted: <b>${escapeHtml(formatDateTime(existing.started_at))}</b>`);
   const mileage = parseFloat(String(body || '').trim());
   if (!Number.isFinite(mileage)) return send(msg.chat.id, 'Use: <code>/phvstart 112280</code>');
-  const { error } = await supabase.from('phv_active_session').upsert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, start_mileage: mileage, started_at: nowIso(), updated_at: nowIso() }, { onConflict: 'telegram_user_id' });
+  const startedAt = telegramMessageIso(msg);
+  const { error } = await supabase.from('phv_active_session').upsert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, start_mileage: mileage, started_at: startedAt, updated_at: nowIso() }, { onConflict: 'telegram_user_id' });
   if (error) { console.error(error); return send(msg.chat.id, 'Could not start PHV session.'); }
-  return send(msg.chat.id, `🚗 PHV session started\nStart mileage: <b>${num(mileage, 0)}</b>`, { reply_markup: { inline_keyboard: [[{ text: '📍 Mid Session', callback_data: 'show:phvnow' }, { text: '🏁 End Session', callback_data: 'show:phvend' }]] } });
+  const maintenanceItems = await getMaintenanceItems(msg.from.id);
+  const lines = [
+    '🚗 <b>PHV session started</b>',
+    `Start time: <b>${escapeHtml(formatDateTime(startedAt))}</b>`,
+    `Start mileage: <b>${num(mileage, 0)}</b>`,
+  ];
+  lines.push(...maintenanceWatchLines(maintenanceItems, mileage));
+  return send(msg.chat.id, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '📍 Mid Session', callback_data: 'show:phvnow' }, { text: '🏁 End Session', callback_data: 'show:phvend' }]] } });
 }
 async function handlePhvNow(msg, body) {
   await ensureUser(msg);
   const active = await getActiveSession(msg.from.id);
   if (!active) return send(msg.chat.id, 'No active PHV session found. Use <code>/phvstart starting_mileage</code> first.');
   const parsed = parsePhvNowBody(body);
-  if (!parsed) return send(msg.chat.id, 'Use: <code>/phvnow gross:62 | hours:1.8 | current:112314</code>');
+  if (!parsed) return send(msg.chat.id, 'Use: <code>/phvnow gross:62 | current:112314</code> or <code>/phvnow gross:62 | current:112314</code>');
   const km = parsed.current_mileage - Number(active.start_mileage || 0);
   if (!(km >= 0)) return send(msg.chat.id, 'Current mileage cannot be lower than start mileage.');
+  const currentAt = telegramMessageIso(msg);
+  const autoHours = durationHoursBetween(active.started_at, currentAt);
+  const effectiveHours = Number.isFinite(parsed.hours_worked) ? parsed.hours_worked : autoHours;
+  if (!Number.isFinite(effectiveHours) || effectiveHours <= 0) return send(msg.chat.id, 'Could not determine hours worked yet. Try again in a few minutes or add <code>hours:x.x</code>.');
   let petrol = parsed.petrol_cost;
   if (petrol === null || petrol === undefined) {
     const settings = await getOrCreatePhvSettings(msg);
     petrol = calculatePhvPetrolCost(km, settings) ?? 0;
   }
-  const pseudo = { log_date: todayDateString(), gross_amount: parsed.gross_amount, hours_worked: parsed.hours_worked, petrol_cost: petrol };
+  const pseudo = { log_date: todayDateString(), gross_amount: parsed.gross_amount, hours_worked: effectiveHours, petrol_cost: petrol };
   const c = phvComputed(pseudo);
   const allLogs = await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString());
   const comparable = summarizeComparableSessions(allLogs, getDayType(todayDateString()), null);
   const score = scoreSession(c.hourlyNet);
+  const maintenanceItems = await getMaintenanceItems(msg.from.id);
   const lines = [
     '<b>PHV mid-session</b>',
+    `Started: <b>${escapeHtml(formatDateTime(active.started_at))}</b>`,
+    `Checked at: <b>${escapeHtml(formatDateTime(currentAt))}</b>`,
     `KM so far: <b>${num(km)}</b>`,
     `Gross so far: <b>${currency(parsed.gross_amount)}</b>`,
     `Petrol est.: <b>${currency(petrol)}</b>`,
     `Net so far: <b>${currency(c.net)}</b>`,
-    `Hours so far: <b>${num(parsed.hours_worked)}</b>`,
+    `Hours so far: <b>${num(effectiveHours)}</b> (${escapeHtml(formatDurationHours(effectiveHours))})`,
     `Hourly net so far: <b>${currency(c.hourlyNet)}</b>`,
     `Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
     `Signal: <b>${escapeHtml(buildStopRecommendation(pseudo, comparable))}</b>`,
   ];
+  if (parsed.hours_worked === null) lines.push('Hours source: <b>auto from Telegram timestamps</b>');
+  lines.push(...maintenanceWatchLines(maintenanceItems, parsed.current_mileage));
   return send(msg.chat.id, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '🏁 End Session', callback_data: 'show:phvend' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }]] } });
 }
 async function handlePhvEnd(msg, body) {
@@ -743,9 +802,13 @@ async function handlePhvEnd(msg, body) {
   const active = await getActiveSession(msg.from.id);
   if (!active) return send(msg.chat.id, 'No active PHV session found. Use <code>/phvstart starting_mileage</code> first.');
   const parsed = parsePhvEnd(body);
-  if (!parsed) return send(msg.chat.id, 'Use: <code>/phvend 112348 | gross:145 | hours:2.5</code>');
+  if (!parsed) return send(msg.chat.id, 'Use: <code>/phvend 112348 | gross:145</code> or <code>/phvend 112348 | gross:145</code>');
   const km = parsed.end_mileage - Number(active.start_mileage || 0);
   if (!(km >= 0)) return send(msg.chat.id, 'End mileage cannot be lower than start mileage.');
+  const endedAt = telegramMessageIso(msg);
+  const autoHours = durationHoursBetween(active.started_at, endedAt);
+  const effectiveHours = Number.isFinite(parsed.hours_worked) ? parsed.hours_worked : autoHours;
+  if (!Number.isFinite(effectiveHours) || effectiveHours <= 0) return send(msg.chat.id, 'Could not determine hours worked yet. Try again in a few minutes or add <code>hours:x.x</code>.');
   let petrol = parsed.petrol_cost;
   let autoPetrol = false;
   if (petrol === null || petrol === undefined) {
@@ -758,7 +821,7 @@ async function handlePhvEnd(msg, body) {
     chat_id: msg.chat.id,
     log_date: parsed.log_date,
     gross_amount: parsed.gross_amount,
-    hours_worked: parsed.hours_worked,
+    hours_worked: effectiveHours,
     km_driven: km,
     petrol_cost: petrol,
     start_mileage: Number(active.start_mileage),
@@ -771,15 +834,16 @@ async function handlePhvEnd(msg, body) {
   if (insertErr) { console.error(insertErr); return send(msg.chat.id, 'Could not save PHV session end log.'); }
   const { error: delErr } = await supabase.from('phv_active_session').delete().eq('telegram_user_id', msg.from.id);
   if (delErr) console.error(delErr);
-  const currentOdo = parsed.end_mileage;
   const maintenanceItems = await getMaintenanceItems(msg.from.id);
-  const dueSoon = maintenanceItems.map((item) => ({ ...item, remaining: Number(item.next_due_mileage) - currentOdo })).filter((x) => x.remaining <= 1000).sort((a, b) => a.remaining - b.remaining).slice(0, 3);
   const c = phvComputed(payload);
   const allLogs = await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString());
   const comparable = summarizeComparableSessions(allLogs, getDayType(payload.log_date), payload.log_date);
   const score = scoreSession(c.hourlyNet);
   const lines = [
     '<b>PHV session ended</b>',
+    `Start time: <b>${escapeHtml(formatDateTime(active.started_at))}</b>`,
+    `End time: <b>${escapeHtml(formatDateTime(endedAt))}</b>`,
+    `Duration: <b>${escapeHtml(formatDurationHours(effectiveHours))}</b>`,
     `Start mileage: <b>${num(active.start_mileage, 0)}</b>`,
     `End mileage: <b>${num(parsed.end_mileage, 0)}</b>`,
     `Session KM: <b>${num(km)}</b>`,
@@ -791,15 +855,9 @@ async function handlePhvEnd(msg, body) {
     `Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
     `Signal: <b>${escapeHtml(buildStopRecommendation(payload, comparable))}</b>`,
   ];
+  if (parsed.hours_worked === null) lines.push('Hours source: <b>auto from Telegram timestamps</b>');
   if (autoPetrol) lines.push('Petrol source: <b>auto-filled from PHV settings</b>');
-  if (dueSoon.length) {
-    lines.push('', '<b>Maintenance watch</b>');
-    dueSoon.forEach((item) => {
-      const rem = Number(item.remaining);
-      const text = rem < 0 ? `${Math.abs(rem)} km overdue` : `${rem} km remaining`;
-      lines.push(`• ${escapeHtml(item.item_name)} — due at <b>${escapeHtml(String(item.next_due_mileage))}</b> (${escapeHtml(text)})`);
-    });
-  }
+  lines.push(...maintenanceWatchLines(maintenanceItems, parsed.end_mileage));
   return send(msg.chat.id, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '🛠 Maintenance', callback_data: 'show:maintstatus' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }]] } });
 }
 async function handlePhvToday(msg, editContext = null) {
@@ -1206,11 +1264,11 @@ async function routeCallback(query) {
     }
     if (data === 'show:phvnow') {
       pendingInputs.set(query.from.id, { kind: 'phvnow' });
-      return send(msg.chat.id, 'Send: <code>gross:62 | hours:1.8 | current:112314</code>');
+      return send(msg.chat.id, 'Send: <code>gross:62 | current:112314</code>\nOptional: add <code>| hours:1.8</code> to override auto timing.');
     }
     if (data === 'show:phvend') {
       pendingInputs.set(query.from.id, { kind: 'phvend' });
-      return send(msg.chat.id, 'Send: <code>112348 | gross:145 | hours:2.5</code>');
+      return send(msg.chat.id, 'Send: <code>112348 | gross:145</code>\nOptional: add <code>| hours:2.5</code> to override auto timing.');
     }
     if (data === 'hint:note') return send(msg.chat.id, 'Send a note like: <code>note: check tyre pressure</code>');
     if (data === 'hint:task') return send(msg.chat.id, 'Send a task like: <code>task: renew road tax</code>');
