@@ -2,6 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { createClient } = require('@supabase/supabase-js');
+const axios = require('axios');
+const Tesseract = require('tesseract.js');
 
 const {
   TELEGRAM_BOT_TOKEN,
@@ -11,23 +13,95 @@ const {
   PORT = 10000,
 } = process.env;
 
-const missing = [
-  'TELEGRAM_BOT_TOKEN',
-  'WEBHOOK_URL',
-  'SUPABASE_URL',
-  'SUPABASE_ANON_KEY',
-].filter((k) => !process.env[k]);
-
+const required = ['TELEGRAM_BOT_TOKEN', 'WEBHOOK_URL', 'SUPABASE_URL', 'SUPABASE_ANON_KEY'];
+const missing = required.filter((key) => !process.env[key]);
 if (missing.length) {
   console.error(`Missing env vars: ${missing.join(', ')}`);
   process.exit(1);
 }
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
-
+app.use(express.json({ limit: '20mb' }));
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { webHook: true });
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+const pendingInputs = new Map();
+const pendingReceiptActions = new Map();
+
+function escapeHtml(text = '') {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+function nowIso() { return new Date().toISOString(); }
+function sgNow() { return new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Singapore' })); }
+function todayDateString() {
+  const d = sgNow();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function currency(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return '-';
+  return `$${x.toFixed(2)}`;
+}
+function num(x, dp = 2) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n.toFixed(dp) : '-';
+}
+function addDays(dateString, days) {
+  const d = new Date(`${dateString}T12:00:00+08:00`);
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+function addMonths(dateString, count) {
+  const d = new Date(`${dateString}T12:00:00+08:00`);
+  d.setMonth(d.getMonth() + count);
+  return d.toISOString().slice(0, 10);
+}
+function addYears(dateString, count) {
+  const d = new Date(`${dateString}T12:00:00+08:00`);
+  d.setFullYear(d.getFullYear() + count);
+  return d.toISOString().slice(0, 10);
+}
+function dueInDays(dateString) {
+  const today = new Date(`${todayDateString()}T00:00:00+08:00`);
+  const due = new Date(`${String(dateString).slice(0, 10)}T00:00:00+08:00`);
+  return Math.round((due - today) / 86400000);
+}
+function humanDueLabel(days) {
+  if (days < 0) return `${Math.abs(days)} day(s) overdue`;
+  if (days === 0) return 'due today';
+  if (days === 1) return 'due tomorrow';
+  return `due in ${days} day(s)`;
+}
+function getDayType(dateString) {
+  const d = new Date(`${dateString}T12:00:00+08:00`);
+  const day = d.getDay();
+  return day === 0 || day === 6 ? 'weekend' : 'weekday';
+}
+function scoreSession(hourlyNet) {
+  const x = Number(hourlyNet || 0);
+  if (x >= 50) return { label: 'Excellent', emoji: '🟢' };
+  if (x >= 35) return { label: 'Average', emoji: '🟡' };
+  return { label: 'Poor', emoji: '🔴' };
+}
+function parseDateTimeInput(input) {
+  const trimmed = String(input || '').trim();
+  const match = trimmed.match(/^(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}:\d{2}))?$/);
+  if (!match) return null;
+  const datePart = match[1];
+  const timePart = match[2] || '09:00';
+  const iso = new Date(`${datePart}T${timePart}:00+08:00`);
+  if (Number.isNaN(iso.getTime())) return null;
+  return { date: datePart, time: timePart, iso: iso.toISOString() };
+}
+function formatDateTime(value) {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value || '');
+  const sg = new Date(d.toLocaleString('en-US', { timeZone: 'Asia/Singapore' }));
+  return `${sg.getFullYear()}-${String(sg.getMonth() + 1).padStart(2, '0')}-${String(sg.getDate()).padStart(2, '0')} ${String(sg.getHours()).padStart(2, '0')}:${String(sg.getMinutes()).padStart(2, '0')}`;
+}
 
 const MAIN_KEYBOARD = {
   inline_keyboard: [
@@ -40,197 +114,64 @@ const MAIN_KEYBOARD = {
       { text: '🗓 Weekly', callback_data: 'show:weekly' },
     ],
     [
-      { text: '🚗 PHV Today', callback_data: 'show:phvtoday' },
+      { text: '🚗 Start Session', callback_data: 'show:phvstart' },
+      { text: '🏁 End Session', callback_data: 'show:phvend' },
+    ],
+    [
+      { text: '📈 PHV Week', callback_data: 'show:phvweek' },
       { text: '❓ Drive?', callback_data: 'show:shoulddrive' },
     ],
     [
       { text: '⛽ PHV Settings', callback_data: 'show:phvsettings' },
-      { text: '🧠 Decide', callback_data: 'hint:decide' },
+      { text: '🛠 Maintenance', callback_data: 'show:maintstatus' },
     ],
   ],
 };
 
-const pendingPhvSettingInputs = new Map();
-
-function escapeHtml(text = '') {
-  return String(text)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+async function send(chatId, text, extra = {}) {
+  return bot.sendMessage(chatId, text, {
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    ...extra,
+  });
 }
-
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function toLocalDate(date = new Date()) {
-  const offsetMs = 8 * 60 * 60 * 1000;
-  return new Date(date.getTime() + offsetMs);
-}
-
-function todayDateString() {
-  return toLocalDate().toISOString().slice(0, 10);
-}
-
-function startOfLocalDayIso(daysOffset = 0) {
-  const d = toLocalDate();
-  d.setUTCHours(0, 0, 0, 0);
-  d.setUTCDate(d.getUTCDate() + daysOffset);
-  return new Date(d.getTime() - 8 * 60 * 60 * 1000).toISOString();
-}
-
-function parseDateTimeInput(input) {
-  const trimmed = String(input || '').trim();
-  const match = trimmed.match(/^(\d{4}-\d{2}-\d{2})(?:\s+(\d{2}:\d{2}))?$/);
-  if (!match) return null;
-  const datePart = match[1];
-  const timePart = match[2] || '09:00';
-  const iso = new Date(`${datePart}T${timePart}:00+08:00`);
-  if (Number.isNaN(iso.getTime())) return null;
-  return { date: datePart, time: timePart, iso: iso.toISOString() };
-}
-
-function formatDate(dateValue) {
-  const d = new Date(dateValue);
-  if (Number.isNaN(d.getTime())) return String(dateValue || '');
-  return toLocalDate(d).toISOString().slice(0, 10);
-}
-
-function formatDateTime(dateValue) {
-  const d = new Date(dateValue);
-  if (Number.isNaN(d.getTime())) return String(dateValue || '');
-  const local = toLocalDate(d);
-  return `${local.toISOString().slice(0, 10)} ${local.toISOString().slice(11, 16)}`;
-}
-
-function dueInDays(dateString) {
-  const today = new Date(`${todayDateString()}T00:00:00+08:00`);
-  const due = new Date(`${String(dateString).slice(0, 10)}T00:00:00+08:00`);
-  return Math.round((due - today) / 86400000);
-}
-
-function addMonths(dateString, count) {
-  const d = new Date(`${String(dateString).slice(0, 10)}T12:00:00+08:00`);
-  d.setMonth(d.getMonth() + count);
-  return d.toISOString().slice(0, 10);
-}
-
-function addYears(dateString, count) {
-  const d = new Date(`${String(dateString).slice(0, 10)}T12:00:00+08:00`);
-  d.setFullYear(d.getFullYear() + count);
-  return d.toISOString().slice(0, 10);
-}
-
-function computeNextDueDate(baseDate, recurrence) {
-  let next = String(baseDate).slice(0, 10);
-  const today = todayDateString();
-  if (!recurrence || recurrence === 'none') return next;
-
-  while (next < today) {
-    if (recurrence === 'monthly') next = addMonths(next, 1);
-    else if (recurrence === 'yearly') next = addYears(next, 1);
-    else break;
+async function editOrSend(chatId, messageId, text, extra = {}) {
+  try {
+    return await bot.editMessageText(text, {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...extra,
+    });
+  } catch (err) {
+    return send(chatId, text, extra);
   }
-  return next;
 }
 
-function computeFollowingDueDate(currentDueDate, recurrence) {
-  if (recurrence === 'monthly') return addMonths(currentDueDate, 1);
-  if (recurrence === 'yearly') return addYears(currentDueDate, 1);
-  return currentDueDate;
-}
-
-function humanDueLabel(days) {
-  if (days < 0) return `${Math.abs(days)} day(s) overdue`;
-  if (days === 0) return 'due today';
-  if (days === 1) return 'due tomorrow';
-  return `due in ${days} day(s)`;
-}
-
-function parseAdminAdd(text) {
-  const parts = String(text || '').split('|').map((s) => s.trim());
-  if (parts.length < 3) return null;
-
-  const title = parts[0];
-  const dueDate = parts[1];
-  const recurrence = (parts[2] || 'none').toLowerCase();
-  const leadDaysRaw = parts[3] || '7,1';
-
-  if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return null;
-  if (!['none', 'monthly', 'yearly'].includes(recurrence)) return null;
-
-  let leadDays = [];
-  if (leadDaysRaw.toLowerCase() !== 'none') {
-    leadDays = leadDaysRaw
-      .split(',')
-      .map((x) => parseInt(x.trim(), 10))
-      .filter((n) => Number.isInteger(n) && n >= 0)
-      .slice(0, 10);
-  }
-
-  return {
-    title,
-    dueDate,
-    recurrence,
-    leadDays,
+async function ensureUser(msg) {
+  const row = {
+    telegram_user_id: msg.from.id,
+    chat_id: msg.chat.id,
+    username: msg.from.username || null,
+    first_name: msg.from.first_name || null,
+    last_name: msg.from.last_name || null,
+    updated_at: nowIso(),
   };
+  const { error } = await supabase.from('users').upsert(row, { onConflict: 'telegram_user_id' });
+  if (error) throw error;
 }
-
-function parsePhvBody(body) {
-  const parts = String(body || '').split('|').map((s) => s.trim()).filter(Boolean);
-  const result = {};
-
-  for (const part of parts) {
-    const m = part.match(/^(date|gross|hours|km|petrol|trip|notes?)\s*[:=]?\s*(.+)$/i);
-    if (!m) continue;
-    const key = m[1].toLowerCase();
-    const value = m[2].trim();
-    result[key] = value;
-  }
-
-  const date = result.date || todayDateString();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
-
-  const gross = parseFloat(result.gross || '');
-  const hours = parseFloat(result.hours || '');
-  const km = parseFloat(result.km || '');
-  const petrol = result.petrol !== undefined ? parseFloat(result.petrol) : null;
-  const tripCount = result.trip !== undefined ? parseInt(result.trip, 10) : null;
-  const notes = result.note || result.notes || null;
-
-  if (!Number.isFinite(gross) || !Number.isFinite(hours)) return null;
-
-  return {
-    log_date: date,
-    gross_amount: gross,
-    hours_worked: hours,
-    km_driven: Number.isFinite(km) ? km : null,
-    petrol_cost: Number.isFinite(petrol) ? petrol : null,
-    trip_count: Number.isInteger(tripCount) ? tripCount : null,
-    notes,
-  };
-}
-
-function currency(n) {
-  if (n === null || n === undefined || Number.isNaN(Number(n))) return '-';
-  return `$${Number(n).toFixed(2)}`;
-}
-
 
 async function getOrCreatePhvSettings(msgOrUser) {
   const telegramUserId = msgOrUser.from ? msgOrUser.from.id : msgOrUser.telegram_user_id;
   const chatId = msgOrUser.chat ? msgOrUser.chat.id : msgOrUser.chat_id;
-
   const { data: existing, error } = await supabase
     .from('phv_settings')
     .select('*')
     .eq('telegram_user_id', telegramUserId)
-    .limit(1)
     .maybeSingle();
-
   if (error) throw error;
   if (existing) return existing;
-
   const defaults = {
     telegram_user_id: telegramUserId,
     chat_id: chatId,
@@ -243,728 +184,241 @@ async function getOrCreatePhvSettings(msgOrUser) {
     cost_per_km_override: 0.16,
     updated_at: nowIso(),
   };
-
-  const { data: created, error: insertErr } = await supabase
-    .from('phv_settings')
-    .upsert(defaults, { onConflict: 'telegram_user_id' })
-    .select('*')
-    .single();
-
-  if (insertErr) throw insertErr;
+  const { data: created, error: createErr } = await supabase.from('phv_settings').upsert(defaults, { onConflict: 'telegram_user_id' }).select('*').single();
+  if (createErr) throw createErr;
   return created;
 }
-
 function calculateEffectivePetrolPrice(settings) {
   const basePrice = Number(settings.petrol_price_per_litre || 0);
   const discountPercent = Number(settings.discount_percent || 0);
   const fixedRebate = Number(settings.fixed_rebate || 0);
   const rebateThreshold = Number(settings.rebate_threshold || 0);
   if (!(basePrice > 0)) return 0;
-
-  const discountedPrice = basePrice * (1 - (discountPercent / 100));
-  if (!(fixedRebate > 0) || !(rebateThreshold > 0) || !(basePrice > 0)) return discountedPrice;
-
+  const discountedPrice = basePrice * (1 - discountPercent / 100);
+  if (!(fixedRebate > 0) || !(rebateThreshold > 0)) return discountedPrice;
   const litresAtThreshold = rebateThreshold / basePrice;
   if (!(litresAtThreshold > 0)) return discountedPrice;
   const discountedTotal = discountedPrice * litresAtThreshold;
-  const finalTotal = Math.max(discountedTotal - fixedRebate, 0);
-  return finalTotal / litresAtThreshold;
+  return Math.max(discountedTotal - fixedRebate, 0) / litresAtThreshold;
 }
-
 function calculateAutoCostPerKm(settings) {
   const kmpl = Number(settings.fuel_consumption_kmpl || 0);
   if (!(kmpl > 0)) return 0;
-  const effectivePrice = calculateEffectivePetrolPrice(settings);
-  return effectivePrice / kmpl;
+  return calculateEffectivePetrolPrice(settings) / kmpl;
 }
-
 function calculatePhvPetrolCost(kmDriven, settings) {
   const km = Number(kmDriven || 0);
   if (!(km > 0)) return null;
-  const mode = String(settings.mode || 'simple');
-  let costPerKm = null;
-
-  if (mode === 'simple') {
-    const override = Number(settings.cost_per_km_override || 0);
-    costPerKm = override > 0 ? override : calculateAutoCostPerKm(settings);
+  let costPerKm = 0;
+  if ((settings.mode || 'simple') === 'simple') {
+    costPerKm = Number(settings.cost_per_km_override || 0) || calculateAutoCostPerKm(settings);
   } else {
     costPerKm = calculateAutoCostPerKm(settings);
   }
-
   if (!(costPerKm > 0)) return null;
   return Number((km * costPerKm).toFixed(2));
 }
-
-function phvSettingsText(settings) {
-  const effectivePrice = calculateEffectivePetrolPrice(settings);
-  const autoCostKm = calculateAutoCostPerKm(settings);
-  const modeLabel = settings.mode === 'auto' ? 'Auto calculation' : 'Simple fixed cost/km';
-  return [
-    '<b>PHV settings</b>',
-    `Mode: <b>${escapeHtml(modeLabel)}</b>`,
-    '',
-    `Fuel consumption: <b>${escapeHtml(Number(settings.fuel_consumption_kmpl || 0).toFixed(2))} km/L</b>`,
-    `Petrol price: <b>${escapeHtml(currency(settings.petrol_price_per_litre))}/L</b>`,
-    `Discount: <b>${escapeHtml(String(Number(settings.discount_percent || 0).toFixed(2)))}%</b>`,
-    `Fixed rebate: <b>${escapeHtml(currency(settings.fixed_rebate))}</b> off <b>${escapeHtml(currency(settings.rebate_threshold))}</b>`,
-    `Effective petrol price: <b>${escapeHtml(currency(effectivePrice))}/L</b>`,
-    `Auto cost/km: <b>${escapeHtml(currency(autoCostKm))}</b>`,
-    `Simple cost/km override: <b>${escapeHtml(currency(settings.cost_per_km_override))}</b>`,
-    '',
-    'When you log PHV without petrol, the bot auto-fills petrol using the current mode.',
-  ].join('\n');
-}
-
-function phvSettingsButtons(settings) {
-  const modeText = settings.mode === 'auto' ? 'Switch to Simple mode' : 'Switch to Auto mode';
-  return {
-    inline_keyboard: [
-      [
-        { text: modeText, callback_data: 'phvset:togglemode' },
-      ],
-      [
-        { text: 'Edit Fuel Consumption', callback_data: 'phvset:edit:fuel_consumption_kmpl' },
-        { text: 'Edit Petrol Price', callback_data: 'phvset:edit:petrol_price_per_litre' },
-      ],
-      [
-        { text: 'Edit Discount %', callback_data: 'phvset:edit:discount_percent' },
-        { text: 'Edit Rebate', callback_data: 'phvset:edit:fixed_rebate' },
-      ],
-      [
-        { text: 'Edit Rebate Threshold', callback_data: 'phvset:edit:rebate_threshold' },
-        { text: 'Edit Cost/km Override', callback_data: 'phvset:edit:cost_per_km_override' },
-      ],
-      [
-        { text: '🔄 Refresh', callback_data: 'show:phvsettings' },
-        { text: '➕ Menu', callback_data: 'show:menu' },
-      ],
-    ],
-  };
-}
-
-function phvSettingPrompt(field) {
-  const prompts = {
-    fuel_consumption_kmpl: 'Send the new fuel consumption in km/L. Example: <code>15.3</code>',
-    petrol_price_per_litre: 'Send the new petrol price per litre. Example: <code>3.46</code>',
-    discount_percent: 'Send the new discount percent. Example: <code>27</code>',
-    fixed_rebate: 'Send the fixed rebate amount. Example: <code>3</code>',
-    rebate_threshold: 'Send the rebate threshold spend amount. Example: <code>60</code>',
-    cost_per_km_override: 'Send the simple cost per km override. Example: <code>0.16</code>',
-  };
-  return prompts[field] || 'Send the new numeric value.';
-}
-
-
 function phvComputed(log) {
   const gross = Number(log.gross_amount || 0);
   const petrol = Number(log.petrol_cost || 0);
   const hours = Number(log.hours_worked || 0);
   const net = gross - petrol;
-  const hourlyGross = hours > 0 ? gross / hours : 0;
-  const hourlyNet = hours > 0 ? net / hours : 0;
-  return { net, hourlyGross, hourlyNet };
-}
-
-
-function getDayType(dateString) {
-  const d = new Date(`${String(dateString).slice(0, 10)}T12:00:00+08:00`);
-  const day = d.getDay();
-  return day === 0 || day === 6 ? 'weekend' : 'weekday';
-}
-
-function expectedSessionHours(dateString) {
-  return getDayType(dateString) === 'weekend' ? 6 : 4;
-}
-
-function scoreSession(hourlyNet) {
-  const value = Number(hourlyNet || 0);
-  if (value >= 50) return { label: 'Excellent', emoji: '🟢', color: 'excellent' };
-  if (value >= 35) return { label: 'Average', emoji: '🟡', color: 'average' };
-  return { label: 'Poor', emoji: '🔴', color: 'poor' };
-}
-
-function summarizeComparableSessions(logs, dayType, excludeDate = null) {
-  const filtered = (logs || []).filter((log) => getDayType(log.log_date) === dayType && (!excludeDate || log.log_date !== excludeDate));
-  const summary = summarizePhv(filtered);
-  summary.count = filtered.length;
-  summary.logs = filtered;
-  return summary;
-}
-
-function buildStopRecommendation(log, comparableSummary) {
-  const c = phvComputed(log);
-  const hours = Number(log.hours_worked || 0);
-  const maxHours = expectedSessionHours(log.log_date);
-  const pct = maxHours > 0 ? hours / maxHours : 0;
-  const benchmark = comparableSummary && comparableSummary.count ? Number(comparableSummary.hourlyNet || 0) : 0;
-  const softFloor = benchmark > 0 ? Math.max(35, benchmark * 0.85) : 35;
-  const hardFloor = benchmark > 0 ? Math.max(30, benchmark * 0.75) : 30;
-
-  if (hours >= maxHours) {
-    return 'You are already at or beyond your usual session window. Stopping is reasonable unless demand is clearly strong.';
-  }
-  if (pct >= 0.75 && c.hourlyNet < hardFloor) {
-    return 'Hourly net is low relative to your usual range and you are already late into the session. Consider stopping soon.';
-  }
-  if (pct >= 0.5 && c.hourlyNet < softFloor) {
-    return 'This session is running below your normal pace. If the next 30 minutes stay weak, consider stopping.';
-  }
-  if (c.hourlyNet >= Math.max(45, benchmark)) {
-    return 'This session is still healthy for your fixed hours. Continue if you feel alert.';
-  }
-  return 'Borderline session. Reassess after the next block of driving instead of forcing more low-value time.';
-}
-
-function buildShouldDriveAdvice(dateString, comparableSummary) {
-  const dayType = getDayType(dateString);
-  if (!comparableSummary || comparableSummary.count === 0) {
-    return {
-      headline: `No recent ${dayType} data yet`,
-      recommendation: 'Go only if you already planned to. Build 3 to 5 logs first for a useful read.',
-      confidence: 'low',
-    };
-  }
-
-  const hourly = Number(comparableSummary.hourlyNet || 0);
-  let headline = `Based on your recent ${dayType} sessions`;
-  let recommendation = 'Neutral.';
-  let confidence = comparableSummary.count >= 5 ? 'medium' : 'low';
-
-  if (hourly >= 45) {
-    recommendation = 'Worth going. Your recent sessions have been strong enough to justify the trip.';
-    confidence = comparableSummary.count >= 5 ? 'high' : 'medium';
-  } else if (hourly >= 35) {
-    recommendation = 'Reasonable to go, but keep expectations moderate and protect your stop time discipline.';
-  } else {
-    recommendation = 'Recent returns have been weak. Only go if you have another reason or expect conditions to be unusually good.';
-  }
-
-  return { headline, recommendation, confidence };
-}
-
-function compareWeekdayWeekend(logs) {
-  const weekday = summarizeComparableSessions(logs, 'weekday');
-  const weekend = summarizeComparableSessions(logs, 'weekend');
-  return { weekday, weekend };
-}
-
-function buildDecisionAdvice(input) {
-  const text = String(input || '').trim();
-  const lower = text.toLowerCase();
-  const amountMatches = [...lower.matchAll(/\$?\s*(\d+(?:\.\d+)?)/g)].map((m) => Number(m[1]));
-  const amount = amountMatches[0] || null;
-  const urgencyWords = ['urgent', 'today', 'asap', 'immediately', 'now'];
-  const delayWords = ['wait', 'delay', 'later', 'hold'];
-  const repairWords = ['repair', 'service', 'tyre', 'tire', 'insurance', 'renew', 'road tax', 'maintenance'];
-  const investWords = ['invest', 'etf', 'vwra', 'ssb', 'stocks', 'buy'];
-  const restWords = ['rest', 'sleep', 'fatigue', 'tired'];
-
-  let recommendation = 'Lean toward doing the lower-risk option first.';
-  let risk = 'medium';
-  const reasons = [];
-  const actions = [];
-
-  if (repairWords.some((w) => lower.includes(w))) {
-    recommendation = 'If this affects safety, legality, or insurance coverage, do it now instead of delaying.';
-    risk = 'medium-high';
-    reasons.push('Delaying maintenance or renewals can become more expensive or risky later.');
-    actions.push('Check exact due date or service threshold.', 'If cash is tight, prioritize the safety-critical item first.');
-  }
-
-  if (investWords.some((w) => lower.includes(w))) {
-    recommendation = 'Only proceed if your near-term cash needs and emergency buffer are already covered.';
-    risk = 'medium';
-    reasons.push('Investing while cash is tight can force you to sell or stop at the wrong time.');
-    actions.push('Set a fixed monthly amount you can sustain.', 'Keep enough cash for bills due soon.');
-  }
-
-  if (restWords.some((w) => lower.includes(w))) {
-    recommendation = 'Protect sleep and recovery first if the choice affects safety or work quality.';
-    risk = 'high';
-    reasons.push('Fatigue affects driving performance, judgment, and consistency.');
-    actions.push('Cut lower-value tasks today.', 'Reassess after proper rest.');
-  }
-
-  if (delayWords.some((w) => lower.includes(w)) && !repairWords.some((w) => lower.includes(w))) {
-    reasons.push('Waiting can be sensible if the downside of delay is low and cash preservation matters.');
-  }
-
-  if (urgencyWords.some((w) => lower.includes(w))) {
-    reasons.push('Your wording suggests a time-sensitive decision.');
-  }
-
-  if (amount !== null) {
-    if (amount >= 1000) {
-      reasons.push('This is a meaningful amount, so cashflow impact matters.');
-      actions.push('Check whether this amount conflicts with other bills due within 30 days.');
-    } else {
-      reasons.push('The amount is manageable, so convenience and risk reduction may matter more than perfect optimization.');
-    }
-  }
-
-  if (!reasons.length) {
-    reasons.push('Start with the option that reduces downside and keeps future choices open.');
-  }
-  if (!actions.length) {
-    actions.push('Clarify the downside of waiting 7–30 days.', 'Choose the option you can sustain repeatedly, not just once.');
-  }
-
-  return { recommendation, risk, reasons: reasons.slice(0, 3), actions: actions.slice(0, 3) };
-}
-
-async function ensureUser(msg) {
-  const user = msg.from || {};
-  const chatId = msg.chat.id;
-  const payload = {
-    telegram_user_id: user.id,
-    chat_id: chatId,
-    username: user.username || null,
-    first_name: user.first_name || null,
-    last_name: user.last_name || null,
-    updated_at: nowIso(),
+  return {
+    gross, petrol, hours, net,
+    hourlyGross: hours > 0 ? gross / hours : 0,
+    hourlyNet: hours > 0 ? net / hours : 0,
   };
-
-  const { error } = await supabase
-    .from('users')
-    .upsert(payload, { onConflict: 'telegram_user_id' });
-
-  if (error) console.error('ensureUser error', error);
+}
+function summarizePhv(logs) {
+  const total = logs.reduce((acc, row) => {
+    const c = phvComputed(row);
+    acc.count += 1;
+    acc.gross += c.gross;
+    acc.petrol += c.petrol;
+    acc.hours += c.hours;
+    acc.net += c.net;
+    acc.km += Number(row.km_driven || 0);
+    return acc;
+  }, { count: 0, gross: 0, petrol: 0, hours: 0, net: 0, km: 0 });
+  total.hourlyGross = total.hours > 0 ? total.gross / total.hours : 0;
+  total.hourlyNet = total.hours > 0 ? total.net / total.hours : 0;
+  return total;
+}
+function summarizeComparableSessions(logs, dayType, excludeDate = null) {
+  const filtered = logs.filter((row) => getDayType(row.log_date) === dayType && row.log_date !== excludeDate);
+  return summarizePhv(filtered);
+}
+function buildShouldDriveAdvice(dayType, comparable) {
+  const hourly = Number(comparable.hourlyNet || 0);
+  if (!comparable.count) return { headline: 'Not enough data yet', recommendation: 'Log 3 to 5 sessions first so the bot can give a grounded signal.', confidence: 'Low' };
+  if (hourly >= 45) return { headline: 'Yes, worth going', recommendation: `${dayType} sessions have been strong lately.`, confidence: comparable.count >= 5 ? 'High' : 'Medium' };
+  if (hourly >= 30) return { headline: 'Can go, but be selective', recommendation: `${dayType} sessions are okay lately. Stop early if the session turns weak.`, confidence: comparable.count >= 5 ? 'Medium' : 'Low' };
+  return { headline: 'Low ROI lately', recommendation: `${dayType} sessions have been weak lately. Only go if you expect special demand or need the cashflow.`, confidence: comparable.count >= 5 ? 'High' : 'Medium' };
+}
+function buildStopRecommendation(session, comparable) {
+  const c = phvComputed(session);
+  if (c.hours < 1.5) return 'Too early to judge. Keep going unless demand is clearly dead.';
+  if (!comparable.count) return c.hourlyNet >= 35 ? 'Net hourly still looks decent. Continue if demand feels alive.' : 'Hourly is weak. Consider stopping if the next 30 mins stay poor.';
+  if (c.hourlyNet >= comparable.hourlyNet + 5) return 'You are above your recent comparable average. Continue if you still feel fresh.';
+  if (c.hourlyNet >= comparable.hourlyNet - 5) return 'You are around your usual level. Continue only if jobs keep coming.';
+  return 'You are below your recent comparable average. Consider stopping soon if the next stretch stays weak.';
 }
 
-async function send(chatId, text, options = {}) {
-  return bot.sendMessage(chatId, text, {
-    parse_mode: 'HTML',
-    disable_web_page_preview: true,
-    ...options,
-  });
-}
-
-async function editOrSend(chatId, messageId, text, options = {}) {
-  try {
-    return await bot.editMessageText(text, {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      ...options,
-    });
-  } catch (_err) {
-    return send(chatId, text, options);
+function parseAdminAdd(body) {
+  const parts = String(body || '').split('|').map((s) => s.trim());
+  if (parts.length < 3) return null;
+  const title = parts[0];
+  const dueDate = parts[1];
+  const recurrence = String(parts[2] || 'none').toLowerCase();
+  const leadDaysRaw = parts[3] || '7,1';
+  if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) return null;
+  if (!['none', 'monthly', 'yearly'].includes(recurrence)) return null;
+  let leadDays = [];
+  if (leadDaysRaw.toLowerCase() !== 'none') {
+    leadDays = leadDaysRaw.split(',').map((x) => parseInt(x.trim(), 10)).filter((n) => Number.isInteger(n) && n >= 0);
   }
+  return { title, dueDate, recurrence, leadDays };
 }
-
-async function answerCallback(callbackQueryId, text) {
-  try {
-    await bot.answerCallbackQuery(callbackQueryId, text ? { text } : {});
-  } catch (error) {
-    console.error('answerCallback error', error);
+function computeNextDueDate(baseDate, recurrence) {
+  let next = String(baseDate).slice(0, 10);
+  const today = todayDateString();
+  if (!recurrence || recurrence === 'none') return next;
+  while (next < today) {
+    if (recurrence === 'monthly') next = addMonths(next, 1);
+    else if (recurrence === 'yearly') next = addYears(next, 1);
+    else break;
   }
+  return next;
+}
+function computeFollowingDueDate(currentDueDate, recurrence) {
+  if (recurrence === 'monthly') return addMonths(currentDueDate, 1);
+  if (recurrence === 'yearly') return addYears(currentDueDate, 1);
+  return currentDueDate;
 }
 
-async function showHelp(chatId) {
-  const helpText = [
-    '<b>Personal Ops Bot — Phase 2 browser build</b>',
-    '',
-    '<b>Main commands</b>',
-    '/note your text',
-    '/task your task',
-    '/done keyword',
-    '/remind YYYY-MM-DD HH:MM | message',
-    '/adminadd title | YYYY-MM-DD | none|monthly|yearly | 30,7,1',
-    '/admindone keyword',
-    '/due',
-    '/search keyword',
-    '/weekly',
-    '',
-    '<b>Phase 2</b>',
-    '/phvlog date:2026-03-27 | gross:145 | hours:2.5 | km:68 | petrol:18',
-    '/phvtoday',
-    '/phvweek',
-    '/phvsettings',
-    '/shoulddrive',
-    '/decide your question',
-    '',
-    '<b>Natural language examples</b>',
-    'note: check tyre pressure',
-    'task: renew road tax',
-    'idea: add mileage reminders',
-    'done: renew road tax',
-    'due',
-    'weekly',
-    'decide: should I service now or wait 1 month?',
-  ].join('\n');
-
-  await send(chatId, helpText, { reply_markup: MAIN_KEYBOARD });
+function parsePhvBody(body) {
+  const parts = String(body || '').split('|').map((s) => s.trim()).filter(Boolean);
+  const result = {};
+  for (const part of parts) {
+    const m = part.match(/^(date|gross|hours|km|petrol|trip|trips|notes?)\s*[:=]?\s*(.+)$/i);
+    if (m) result[m[1].toLowerCase()] = m[2].trim();
+  }
+  const date = result.date || todayDateString();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+  const gross = parseFloat(result.gross || '');
+  const hours = parseFloat(result.hours || '');
+  const km = parseFloat(result.km || '');
+  const petrol = result.petrol !== undefined ? parseFloat(result.petrol) : null;
+  const tripCount = result.trip !== undefined ? parseInt(result.trip, 10) : (result.trips !== undefined ? parseInt(result.trips, 10) : null);
+  const notes = result.note || result.notes || null;
+  if (!Number.isFinite(gross) || !Number.isFinite(hours)) return null;
+  return {
+    log_date: date,
+    gross_amount: gross,
+    hours_worked: hours,
+    km_driven: Number.isFinite(km) ? km : null,
+    petrol_cost: Number.isFinite(petrol) ? petrol : null,
+    trip_count: Number.isInteger(tripCount) ? tripCount : null,
+    notes,
+  };
+}
+function parsePhvNowBody(body) {
+  const parts = String(body || '').split('|').map((s) => s.trim()).filter(Boolean);
+  const result = {};
+  for (const part of parts) {
+    const m = part.match(/^(gross|hours|current|mileage|petrol)\s*[:=]?\s*(.+)$/i);
+    if (m) result[m[1].toLowerCase()] = m[2].trim();
+  }
+  const gross = parseFloat(result.gross || '');
+  const hours = parseFloat(result.hours || '');
+  const currentMileage = parseFloat(result.current || result.mileage || '');
+  const petrol = result.petrol !== undefined ? parseFloat(result.petrol) : null;
+  if (!Number.isFinite(gross) || !Number.isFinite(hours) || !Number.isFinite(currentMileage)) return null;
+  return { gross_amount: gross, hours_worked: hours, current_mileage: currentMileage, petrol_cost: Number.isFinite(petrol) ? petrol : null };
+}
+function parsePhvEnd(body) {
+  const parts = String(body || '').split('|').map((s) => s.trim()).filter(Boolean);
+  if (!parts.length) return null;
+  const first = parts[0].match(/^\d+(?:\.\d+)?$/) ? parseFloat(parts[0]) : null;
+  const result = {};
+  for (const part of parts) {
+    const m = part.match(/^(end|gross|hours|petrol|date|notes?)\s*[:=]?\s*(.+)$/i);
+    if (m) result[m[1].toLowerCase()] = m[2].trim();
+  }
+  const endMileage = first ?? parseFloat(result.end || '');
+  const gross = parseFloat(result.gross || '');
+  const hours = parseFloat(result.hours || '');
+  const petrol = result.petrol !== undefined ? parseFloat(result.petrol) : null;
+  const date = result.date || todayDateString();
+  const notes = result.note || result.notes || null;
+  if (!Number.isFinite(endMileage) || !Number.isFinite(gross) || !Number.isFinite(hours)) return null;
+  return { end_mileage: endMileage, gross_amount: gross, hours_worked: hours, petrol_cost: Number.isFinite(petrol) ? petrol : null, log_date: date, notes };
+}
+function parseMaintenanceAdd(body) {
+  const parts = String(body || '').split('|').map((s) => s.trim());
+  if (parts.length < 3) return null;
+  const itemName = parts[0];
+  const intervalKm = parseFloat(parts[1]);
+  const lastDoneMileage = parseFloat(parts[2]);
+  const notes = parts[3] || null;
+  if (!itemName || !Number.isFinite(intervalKm) || !Number.isFinite(lastDoneMileage)) return null;
+  return { item_name: itemName, interval_km: intervalKm, last_done_mileage: lastDoneMileage, notes };
+}
+function parseMaintDone(body) {
+  const parts = String(body || '').split('|').map((s) => s.trim());
+  if (parts.length < 2) return null;
+  const itemName = parts[0];
+  const mileage = parseFloat(parts[1]);
+  const cost = parts[2] ? parseFloat(parts[2]) : null;
+  const notes = parts[3] || null;
+  if (!itemName || !Number.isFinite(mileage)) return null;
+  return { item_name: itemName, mileage, cost: Number.isFinite(cost) ? cost : null, notes };
 }
 
-async function getOpenTasks(userId) {
+async function getCurrentOdometer(userId) {
   const { data, error } = await supabase
-    .from('tasks')
+    .from('phv_logs')
+    .select('end_mileage')
+    .eq('telegram_user_id', userId)
+    .not('end_mileage', 'is', null)
+    .order('log_date', { ascending: false })
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  return data?.[0]?.end_mileage ?? null;
+}
+async function getActiveSession(userId) {
+  const { data, error } = await supabase.from('phv_active_session').select('*').eq('telegram_user_id', userId).maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+async function getDueItems(userId) {
+  const tomorrowPlus30 = addDays(todayDateString(), 30);
+  const remindersRes = await supabase
+    .from('reminders')
     .select('*')
     .eq('telegram_user_id', userId)
     .eq('status', 'open')
-    .order('created_at', { ascending: false })
-    .limit(10);
-
-  if (error) throw error;
-  return data || [];
-}
-
-async function getDueItems(userId) {
-  const todayEndIso = startOfLocalDayIso(1);
-
-  const [{ data: reminders, error: rErr }, { data: adminItems, error: aErr }] = await Promise.all([
-    supabase
-      .from('reminders')
-      .select('*')
-      .eq('telegram_user_id', userId)
-      .eq('status', 'open')
-      .lt('remind_at', todayEndIso)
-      .order('remind_at', { ascending: true })
-      .limit(20),
-    supabase
-      .from('admin_items')
-      .select('*')
-      .eq('telegram_user_id', userId)
-      .eq('is_active', true)
-      .order('next_due_date', { ascending: true })
-      .limit(50),
-  ]);
-
-  if (rErr) throw rErr;
-  if (aErr) throw aErr;
-
-  const dueAdmin = (adminItems || []).filter((item) => {
-    const leadDays = item.lead_days || [];
-    if (!leadDays.length) return dueInDays(item.next_due_date) <= 0;
-    return dueInDays(item.next_due_date) <= Math.max(...leadDays);
-  });
-
-  return { reminders: reminders || [], adminItems: dueAdmin, allAdminItems: adminItems || [] };
-}
-
-async function saveNote(msg, content, noteType = 'note') {
-  const { error } = await supabase.from('notes').insert({
-    telegram_user_id: msg.from.id,
-    chat_id: msg.chat.id,
-    note_type: noteType,
-    content,
-    created_at: nowIso(),
-  });
-  if (error) throw error;
-}
-
-async function handleStart(msg) {
-  await ensureUser(msg);
-  const name = escapeHtml(msg.from.first_name || 'there');
-  await send(
-    msg.chat.id,
-    `Hello ${name}.\n\nThis is your <b>browser-only personal ops bot</b>.\nTap a button or use /help.`,
-    { reply_markup: MAIN_KEYBOARD }
-  );
-}
-
-async function handleNote(msg, body, noteType = 'note') {
-  if (!body) return send(msg.chat.id, 'Use: <code>/note your text</code>');
-  await ensureUser(msg);
-  try {
-    await saveNote(msg, body, noteType);
-    await send(msg.chat.id, `Saved ${escapeHtml(noteType)}:\n<blockquote>${escapeHtml(body)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
-  } catch (error) {
-    console.error(error);
-    await send(msg.chat.id, `Could not save ${escapeHtml(noteType)}.`);
-  }
-}
-
-async function handleTask(msg, body) {
-  if (!body) return send(msg.chat.id, 'Use: <code>/task your task</code>');
-  await ensureUser(msg);
-
-  const { error } = await supabase.from('tasks').insert({
-    telegram_user_id: msg.from.id,
-    chat_id: msg.chat.id,
-    content: body,
-    status: 'open',
-    created_at: nowIso(),
-    updated_at: nowIso(),
-  });
-
-  if (error) {
-    console.error(error);
-    return send(msg.chat.id, 'Could not save task.');
-  }
-
-  await send(msg.chat.id, `Saved task:\n<blockquote>${escapeHtml(body)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
-}
-
-async function handleDone(msg, keyword) {
-  if (!keyword) return send(msg.chat.id, 'Use: <code>/done keyword</code>');
-  await ensureUser(msg);
-
-  const { data, error } = await supabase
-    .from('tasks')
-    .select('*')
-    .eq('telegram_user_id', msg.from.id)
-    .eq('status', 'open')
-    .ilike('content', `%${keyword}%`)
-    .order('created_at', { ascending: false })
-    .limit(1);
-
-  if (error) {
-    console.error(error);
-    return send(msg.chat.id, 'Could not search tasks.');
-  }
-
-  const task = data?.[0];
-  if (!task) return send(msg.chat.id, 'No open task matched that keyword.');
-
-  const { error: updateErr } = await supabase
-    .from('tasks')
-    .update({ status: 'done', updated_at: nowIso(), completed_at: nowIso() })
-    .eq('id', task.id);
-
-  if (updateErr) {
-    console.error(updateErr);
-    return send(msg.chat.id, 'Could not mark task done.');
-  }
-
-  await send(msg.chat.id, `Marked done:\n<blockquote>${escapeHtml(task.content)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
-}
-
-async function handleRemind(msg, body) {
-  if (!body || !body.includes('|')) {
-    return send(msg.chat.id, 'Use: <code>/remind YYYY-MM-DD HH:MM | message</code>');
-  }
-  await ensureUser(msg);
-
-  const [left, ...rest] = body.split('|');
-  const datePart = parseDateTimeInput(left.trim());
-  const reminderText = rest.join('|').trim();
-
-  if (!datePart || !reminderText) {
-    return send(msg.chat.id, 'Could not read that reminder. Example: <code>/remind 2026-04-02 09:00 | renew road tax</code>');
-  }
-
-  const { error } = await supabase.from('reminders').insert({
-    telegram_user_id: msg.from.id,
-    chat_id: msg.chat.id,
-    content: reminderText,
-    remind_at: datePart.iso,
-    status: 'open',
-    created_at: nowIso(),
-  });
-
-  if (error) {
-    console.error(error);
-    return send(msg.chat.id, 'Could not save reminder.');
-  }
-
-  await send(
-    msg.chat.id,
-    `Saved reminder for <b>${escapeHtml(datePart.date)} ${escapeHtml(datePart.time)}</b>:\n<blockquote>${escapeHtml(reminderText)}</blockquote>`,
-    { reply_markup: MAIN_KEYBOARD }
-  );
-}
-
-async function handleAdminAdd(msg, body) {
-  const parsed = parseAdminAdd(body);
-  if (!parsed) {
-    return send(msg.chat.id, 'Use: <code>/adminadd title | YYYY-MM-DD | none|monthly|yearly | 30,7,1</code>');
-  }
-  await ensureUser(msg);
-
-  const nextDue = computeNextDueDate(parsed.dueDate, parsed.recurrence);
-
-  const { error } = await supabase.from('admin_items').insert({
-    telegram_user_id: msg.from.id,
-    chat_id: msg.chat.id,
-    title: parsed.title,
-    base_due_date: parsed.dueDate,
-    next_due_date: nextDue,
-    recurrence: parsed.recurrence,
-    lead_days: parsed.leadDays,
-    is_active: true,
-    created_at: nowIso(),
-    updated_at: nowIso(),
-  });
-
-  if (error) {
-    console.error(error);
-    return send(msg.chat.id, 'Could not save admin item.');
-  }
-
-  const leadText = parsed.leadDays.length ? parsed.leadDays.join(', ') : 'none';
-  await send(
-    msg.chat.id,
-    `Saved admin item:\n<b>${escapeHtml(parsed.title)}</b>\nDue: <b>${escapeHtml(nextDue)}</b>\nRecurrence: <b>${escapeHtml(parsed.recurrence)}</b>\nLead days: <b>${escapeHtml(leadText)}</b>`,
-    { reply_markup: MAIN_KEYBOARD }
-  );
-}
-
-async function findAdminItem(userId, keyword) {
-  const { data, error } = await supabase
+    .lte('remind_at', `${tomorrowPlus30}T23:59:59+08:00`)
+    .order('remind_at', { ascending: true })
+    .limit(20);
+  const adminRes = await supabase
     .from('admin_items')
     .select('*')
     .eq('telegram_user_id', userId)
     .eq('is_active', true)
-    .ilike('title', `%${keyword}%`)
+    .lte('next_due_date', tomorrowPlus30)
     .order('next_due_date', { ascending: true })
-    .limit(1);
+    .limit(20);
+  if (remindersRes.error) throw remindersRes.error;
+  if (adminRes.error) throw adminRes.error;
+  return { reminders: remindersRes.data || [], adminItems: adminRes.data || [] };
+}
+async function getOpenTasks(userId) {
+  const { data, error } = await supabase.from('tasks').select('*').eq('telegram_user_id', userId).eq('status', 'open').order('created_at', { ascending: false }).limit(10);
   if (error) throw error;
-  return data?.[0] || null;
+  return data || [];
 }
-
-async function completeAdminItemByRow(chatId, row) {
-  if (!row) return send(chatId, 'Admin item not found.');
-
-  if (row.recurrence === 'none') {
-    const { error } = await supabase
-      .from('admin_items')
-      .update({ is_active: false, updated_at: nowIso() })
-      .eq('id', row.id);
-    if (error) throw error;
-    return send(chatId, `✅ Marked done: <b>${escapeHtml(row.title)}</b>\nNo further reminders for this item.`, { reply_markup: MAIN_KEYBOARD });
-  }
-
-  const nextDue = computeFollowingDueDate(row.next_due_date, row.recurrence);
-  const { error } = await supabase
-    .from('admin_items')
-    .update({ base_due_date: nextDue, next_due_date: nextDue, updated_at: nowIso() })
-    .eq('id', row.id);
-  if (error) throw error;
-
-  return send(chatId, `✅ Marked done: <b>${escapeHtml(row.title)}</b>\nNext due: <b>${escapeHtml(nextDue)}</b>`, { reply_markup: MAIN_KEYBOARD });
-}
-
-async function handleAdminDone(msg, keyword) {
-  if (!keyword) return send(msg.chat.id, 'Use: <code>/admindone keyword</code>');
-  await ensureUser(msg);
-  try {
-    const row = await findAdminItem(msg.from.id, keyword);
-    if (!row) return send(msg.chat.id, 'No active admin item matched that keyword.');
-    return await completeAdminItemByRow(msg.chat.id, row);
-  } catch (error) {
-    console.error(error);
-    return send(msg.chat.id, 'Could not mark admin item done.');
-  }
-}
-
-function buildDueText(reminders, adminItems) {
-  const lines = ['<b>Due overview</b>', ''];
-
-  if (!reminders.length && !adminItems.length) {
-    lines.push('✅ Nothing urgent right now.');
-    return lines.join('\n');
-  }
-
-  if (reminders.length) {
-    lines.push('<b>Reminders due</b>');
-    reminders.forEach((r) => {
-      lines.push(`• ${escapeHtml(formatDateTime(r.remind_at))} — ${escapeHtml(r.content)}`);
-    });
-    lines.push('');
-  }
-
-  if (adminItems.length) {
-    const overdue = adminItems.filter((a) => dueInDays(a.next_due_date) < 0);
-    const today = adminItems.filter((a) => dueInDays(a.next_due_date) === 0);
-    const upcoming = adminItems.filter((a) => dueInDays(a.next_due_date) > 0);
-
-    if (overdue.length) {
-      lines.push('<b>Overdue admin items</b>');
-      overdue.forEach((a) => lines.push(`• ${escapeHtml(a.title)} — ${escapeHtml(a.next_due_date)} (${escapeHtml(humanDueLabel(dueInDays(a.next_due_date)))})`));
-      lines.push('');
-    }
-    if (today.length) {
-      lines.push('<b>Due today</b>');
-      today.forEach((a) => lines.push(`• ${escapeHtml(a.title)} — ${escapeHtml(a.next_due_date)}`));
-      lines.push('');
-    }
-    if (upcoming.length) {
-      lines.push('<b>Upcoming admin items</b>');
-      upcoming.forEach((a) => lines.push(`• ${escapeHtml(a.title)} — ${escapeHtml(a.next_due_date)} (${escapeHtml(humanDueLabel(dueInDays(a.next_due_date)))})`));
-    }
-  }
-
-  return lines.join('\n').trim();
-}
-
-function dueButtons(adminItems) {
-  const rows = [];
-  adminItems.slice(0, 5).forEach((item) => {
-    rows.push([{ text: `✅ Done: ${item.title.slice(0, 20)}`, callback_data: `admindone:${item.id}` }]);
-  });
-  rows.push([
-    { text: '🔄 Refresh due', callback_data: 'show:due' },
-    { text: '🗓 Weekly', callback_data: 'show:weekly' },
-  ]);
-  return { inline_keyboard: rows };
-}
-
-async function handleDue(msg, editContext = null) {
-  await ensureUser(msg);
-  try {
-    const { reminders, adminItems } = await getDueItems(msg.from.id);
-    const text = buildDueText(reminders, adminItems);
-    if (editContext) {
-      return editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: dueButtons(adminItems) });
-    }
-    return send(msg.chat.id, text, { reply_markup: dueButtons(adminItems) });
-  } catch (error) {
-    console.error(error);
-    return send(msg.chat.id, 'Could not load due items.');
-  }
-}
-
-async function handleSearch(msg, keyword) {
-  if (!keyword) return send(msg.chat.id, 'Use: <code>/search keyword</code>');
-  await ensureUser(msg);
-
-  const [notesRes, tasksRes, remindersRes, adminRes, phvRes] = await Promise.all([
-    supabase.from('notes').select('*').eq('telegram_user_id', msg.from.id).ilike('content', `%${keyword}%`).order('created_at', { ascending: false }).limit(5),
-    supabase.from('tasks').select('*').eq('telegram_user_id', msg.from.id).ilike('content', `%${keyword}%`).order('created_at', { ascending: false }).limit(5),
-    supabase.from('reminders').select('*').eq('telegram_user_id', msg.from.id).ilike('content', `%${keyword}%`).order('created_at', { ascending: false }).limit(5),
-    supabase.from('admin_items').select('*').eq('telegram_user_id', msg.from.id).ilike('title', `%${keyword}%`).order('created_at', { ascending: false }).limit(5),
-    supabase.from('phv_logs').select('*').eq('telegram_user_id', msg.from.id).ilike('notes', `%${keyword}%`).order('log_date', { ascending: false }).limit(5),
-  ]);
-
-  const errors = [notesRes.error, tasksRes.error, remindersRes.error, adminRes.error, phvRes.error].filter(Boolean);
-  if (errors.length) {
-    console.error(errors);
-    return send(msg.chat.id, 'Search failed.');
-  }
-
-  const lines = [`<b>Search results for:</b> ${escapeHtml(keyword)}`, ''];
-
-  if (notesRes.data?.length) {
-    lines.push('<b>Notes</b>');
-    notesRes.data.forEach((n) => lines.push(`• [${escapeHtml(n.note_type || 'note')}] ${escapeHtml(n.content)}`));
-    lines.push('');
-  }
-  if (tasksRes.data?.length) {
-    lines.push('<b>Tasks</b>');
-    tasksRes.data.forEach((t) => lines.push(`• [${escapeHtml(t.status)}] ${escapeHtml(t.content)}`));
-    lines.push('');
-  }
-  if (remindersRes.data?.length) {
-    lines.push('<b>Reminders</b>');
-    remindersRes.data.forEach((r) => lines.push(`• ${escapeHtml(formatDateTime(r.remind_at))} — ${escapeHtml(r.content)}`));
-    lines.push('');
-  }
-  if (adminRes.data?.length) {
-    lines.push('<b>Admin items</b>');
-    adminRes.data.forEach((a) => lines.push(`• ${escapeHtml(a.title)} — ${escapeHtml(a.next_due_date)}`));
-    lines.push('');
-  }
-  if (phvRes.data?.length) {
-    lines.push('<b>PHV logs</b>');
-    phvRes.data.forEach((p) => lines.push(`• ${escapeHtml(p.log_date)} — gross ${escapeHtml(currency(p.gross_amount))}`));
-  }
-
-  if (lines.length <= 2) return send(msg.chat.id, 'No matches found.');
-  await send(msg.chat.id, lines.join('\n'), { reply_markup: MAIN_KEYBOARD });
-}
-
 async function getPhvRange(userId, startDate, endDate) {
   const { data, error } = await supabase
     .from('phv_logs')
@@ -972,291 +426,508 @@ async function getPhvRange(userId, startDate, endDate) {
     .eq('telegram_user_id', userId)
     .gte('log_date', startDate)
     .lte('log_date', endDate)
-    .order('log_date', { ascending: false });
+    .order('log_date', { ascending: false })
+    .order('created_at', { ascending: false });
+  if (error) throw error;
+  return data || [];
+}
+async function getMaintenanceItems(userId) {
+  const { data, error } = await supabase.from('maintenance_items').select('*').eq('telegram_user_id', userId).eq('is_active', true).order('item_name');
   if (error) throw error;
   return data || [];
 }
 
-function summarizePhv(logs) {
-  const totals = logs.reduce((acc, log) => {
-    const c = phvComputed(log);
-    acc.gross += Number(log.gross_amount || 0);
-    acc.hours += Number(log.hours_worked || 0);
-    acc.petrol += Number(log.petrol_cost || 0);
-    acc.km += Number(log.km_driven || 0);
-    acc.net += c.net;
-    acc.days += 1;
-    return acc;
-  }, { gross: 0, hours: 0, petrol: 0, km: 0, net: 0, days: 0 });
-
-  totals.hourlyGross = totals.hours > 0 ? totals.gross / totals.hours : 0;
-  totals.hourlyNet = totals.hours > 0 ? totals.net / totals.hours : 0;
-  return totals;
+function buildDueText(reminders, adminItems) {
+  const lines = ['<b>Due overview</b>', ''];
+  if (!reminders.length && !adminItems.length) {
+    lines.push('✅ Nothing urgent right now.');
+    return lines.join('\n');
+  }
+  if (reminders.length) {
+    lines.push('<b>Reminders</b>');
+    reminders.forEach((r) => lines.push(`• ${escapeHtml(formatDateTime(r.remind_at))} — ${escapeHtml(r.content)}`));
+    lines.push('');
+  }
+  if (adminItems.length) {
+    lines.push('<b>Admin items</b>');
+    adminItems.forEach((a) => lines.push(`• ${escapeHtml(a.title)} — ${escapeHtml(a.next_due_date)} (${escapeHtml(humanDueLabel(dueInDays(a.next_due_date)))})`));
+  }
+  return lines.join('\n');
+}
+function dueButtons(items) {
+  const rows = items.slice(0, 5).map((item) => [{ text: `✅ Done: ${item.title.slice(0, 20)}`, callback_data: `admindoneid:${item.id}` }]);
+  rows.push([{ text: '🔄 Refresh Due', callback_data: 'show:due' }, { text: '🗓 Weekly', callback_data: 'show:weekly' }]);
+  return { inline_keyboard: rows };
+}
+function phvSettingsButtons(settings) {
+  return {
+    inline_keyboard: [
+      [{ text: settings.mode === 'auto' ? 'Switch to Simple mode' : 'Switch to Auto mode', callback_data: 'phvset:togglemode' }],
+      [{ text: 'Edit Fuel km/L', callback_data: 'phvset:fuel_consumption_kmpl' }, { text: 'Edit Petrol Price', callback_data: 'phvset:petrol_price_per_litre' }],
+      [{ text: 'Edit Discount %', callback_data: 'phvset:discount_percent' }, { text: 'Edit Fixed Rebate', callback_data: 'phvset:fixed_rebate' }],
+      [{ text: 'Edit Rebate Threshold', callback_data: 'phvset:rebate_threshold' }, { text: 'Edit Cost/km', callback_data: 'phvset:cost_per_km_override' }],
+      [{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }],
+    ],
+  };
+}
+function phvSettingsText(settings) {
+  const effectivePrice = calculateEffectivePetrolPrice(settings);
+  const autoCost = calculateAutoCostPerKm(settings);
+  return [
+    '<b>PHV settings</b>',
+    `Mode: <b>${escapeHtml(settings.mode === 'auto' ? 'Auto calculation' : 'Simple fixed cost/km')}</b>`,
+    '',
+    `Fuel consumption: <b>${num(settings.fuel_consumption_kmpl)} km/L</b>`,
+    `Petrol price: <b>${currency(settings.petrol_price_per_litre)}/L</b>`,
+    `Discount: <b>${num(settings.discount_percent)}%</b>`,
+    `Fixed rebate: <b>${currency(settings.fixed_rebate)}</b> off <b>${currency(settings.rebate_threshold)}</b>`,
+    `Effective petrol price: <b>${currency(effectivePrice)}/L</b>`,
+    `Auto cost/km: <b>${currency(autoCost)}</b>`,
+    `Simple cost/km override: <b>${currency(settings.cost_per_km_override)}</b>`,
+  ].join('\n');
 }
 
+async function handleStart(msg) {
+  await ensureUser(msg);
+  return send(msg.chat.id, [
+    `<b>Hi ${escapeHtml(msg.from.first_name || 'there')}</b>`,
+    '',
+    'This Phase 3 build includes:',
+    '• notes / tasks / reminders',
+    '• admin due tracking',
+    '• PHV settings + PHV logging',
+    '• PHV start / now / end mileage flow',
+    '• mileage-based maintenance tracker',
+    '• screenshot / receipt OCR reader (best effort)',
+    '',
+    'Try:',
+    '<code>/phvstart 112280</code>',
+    '<code>/phvnow gross:62 | hours:1.8 | current:112314</code>',
+    '<code>/phvend 112348 | gross:145 | hours:2.5</code>',
+    '<code>/addmaintenance engine servicing | 8000 | 112000</code>',
+    '<code>/phvsettings</code>',
+  ].join('\n'), { reply_markup: MAIN_KEYBOARD });
+}
+async function showHelp(chatId) {
+  return send(chatId, [
+    '<b>Commands</b>',
+    '',
+    '<b>Capture</b>',
+    '<code>/note text</code>',
+    '<code>/idea text</code>',
+    '<code>/task text</code>',
+    '<code>/done keyword</code>',
+    '<code>/search keyword</code>',
+    '',
+    '<b>Reminders / admin</b>',
+    '<code>/remind YYYY-MM-DD HH:MM | message</code>',
+    '<code>/adminadd title | YYYY-MM-DD | none|monthly|yearly | 30,7,1</code>',
+    '<code>/admindone keyword</code>',
+    '<code>/due</code>',
+    '',
+    '<b>PHV</b>',
+    '<code>/phvlog date:2026-03-27 | gross:145 | hours:2.5 | km:68</code>',
+    '<code>/phvstart 112280</code>',
+    '<code>/phvnow gross:62 | hours:1.8 | current:112314</code>',
+    '<code>/phvend 112348 | gross:145 | hours:2.5</code>',
+    '<code>/phvtoday</code>',
+    '<code>/phvweek</code>',
+    '<code>/shoulddrive</code>',
+    '<code>/phvsettings</code>',
+    '',
+    '<b>Maintenance</b>',
+    '<code>/addmaintenance item | interval_km | last_done_mileage</code>',
+    '<code>/maintenance</code>',
+    '<code>/maintdone item | mileage | optional_cost | optional_note</code>',
+    '',
+    '<b>OCR</b>',
+    'Send a receipt screenshot/photo with a caption like <code>fuel</code>, <code>maintenance</code>, or <code>insurance</code>. The bot will OCR it and suggest what to save.',
+  ].join('\n'), { reply_markup: MAIN_KEYBOARD });
+}
+
+async function handleNote(msg, body, noteType = 'note') {
+  if (!body) return send(msg.chat.id, `Use: <code>/${noteType} your text</code>`);
+  await ensureUser(msg);
+  const { error } = await supabase.from('notes').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, note_type: noteType, content: body, created_at: nowIso() });
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not save note.'); }
+  return send(msg.chat.id, `Saved ${escapeHtml(noteType)}:\n<blockquote>${escapeHtml(body)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
+}
+async function handleTask(msg, body) {
+  if (!body) return send(msg.chat.id, 'Use: <code>/task your task</code>');
+  await ensureUser(msg);
+  const { error } = await supabase.from('tasks').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, content: body, status: 'open', created_at: nowIso(), updated_at: nowIso() });
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not save task.'); }
+  return send(msg.chat.id, `Saved task:\n<blockquote>${escapeHtml(body)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
+}
+async function handleDone(msg, keyword) {
+  if (!keyword) return send(msg.chat.id, 'Use: <code>/done keyword</code>');
+  await ensureUser(msg);
+  const { data, error } = await supabase.from('tasks').select('*').eq('telegram_user_id', msg.from.id).eq('status', 'open').ilike('content', `%${keyword}%`).order('created_at', { ascending: false }).limit(1);
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not search tasks.'); }
+  const task = data?.[0];
+  if (!task) return send(msg.chat.id, 'No open task matched that keyword.');
+  const { error: upd } = await supabase.from('tasks').update({ status: 'done', updated_at: nowIso(), completed_at: nowIso() }).eq('id', task.id);
+  if (upd) { console.error(upd); return send(msg.chat.id, 'Could not mark task done.'); }
+  return send(msg.chat.id, `Marked done:\n<blockquote>${escapeHtml(task.content)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
+}
+async function handleSearch(msg, keyword) {
+  if (!keyword) return send(msg.chat.id, 'Use: <code>/search keyword</code>');
+  await ensureUser(msg);
+  const [notesRes, tasksRes, adminRes, phvRes, maintRes] = await Promise.all([
+    supabase.from('notes').select('*').eq('telegram_user_id', msg.from.id).ilike('content', `%${keyword}%`).limit(5),
+    supabase.from('tasks').select('*').eq('telegram_user_id', msg.from.id).ilike('content', `%${keyword}%`).limit(5),
+    supabase.from('admin_items').select('*').eq('telegram_user_id', msg.from.id).ilike('title', `%${keyword}%`).limit(5),
+    supabase.from('phv_logs').select('*').eq('telegram_user_id', msg.from.id).ilike('notes', `%${keyword}%`).limit(5),
+    supabase.from('maintenance_items').select('*').eq('telegram_user_id', msg.from.id).ilike('item_name', `%${keyword}%`).limit(5),
+  ]);
+  const errors = [notesRes.error, tasksRes.error, adminRes.error, phvRes.error, maintRes.error].filter(Boolean);
+  if (errors.length) { console.error(errors); return send(msg.chat.id, 'Search failed.'); }
+  const lines = [`<b>Search results for:</b> ${escapeHtml(keyword)}`, ''];
+  if (notesRes.data?.length) { lines.push('<b>Notes</b>'); notesRes.data.forEach((x) => lines.push(`• [${escapeHtml(x.note_type)}] ${escapeHtml(x.content)}`)); lines.push(''); }
+  if (tasksRes.data?.length) { lines.push('<b>Tasks</b>'); tasksRes.data.forEach((x) => lines.push(`• [${escapeHtml(x.status)}] ${escapeHtml(x.content)}`)); lines.push(''); }
+  if (adminRes.data?.length) { lines.push('<b>Admin items</b>'); adminRes.data.forEach((x) => lines.push(`• ${escapeHtml(x.title)} — ${escapeHtml(x.next_due_date)}`)); lines.push(''); }
+  if (maintRes.data?.length) { lines.push('<b>Maintenance</b>'); maintRes.data.forEach((x) => lines.push(`• ${escapeHtml(x.item_name)} — next due ${escapeHtml(String(x.next_due_mileage))}`)); lines.push(''); }
+  if (phvRes.data?.length) { lines.push('<b>PHV logs</b>'); phvRes.data.forEach((x) => lines.push(`• ${escapeHtml(x.log_date)} — gross ${escapeHtml(currency(x.gross_amount))}`)); }
+  if (lines.length <= 2) return send(msg.chat.id, 'No matches found.');
+  return send(msg.chat.id, lines.join('\n'), { reply_markup: MAIN_KEYBOARD });
+}
+
+async function handleRemind(msg, body) {
+  if (!body || !body.includes('|')) return send(msg.chat.id, 'Use: <code>/remind YYYY-MM-DD HH:MM | message</code>');
+  await ensureUser(msg);
+  const [left, ...rest] = body.split('|');
+  const dt = parseDateTimeInput(left.trim());
+  const content = rest.join('|').trim();
+  if (!dt || !content) return send(msg.chat.id, 'Could not read that reminder.');
+  const { error } = await supabase.from('reminders').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, content, remind_at: dt.iso, status: 'open', created_at: nowIso() });
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not save reminder.'); }
+  return send(msg.chat.id, `Saved reminder for <b>${escapeHtml(dt.date)} ${escapeHtml(dt.time)}</b>:\n<blockquote>${escapeHtml(content)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
+}
+async function handleAdminAdd(msg, body) {
+  const parsed = parseAdminAdd(body);
+  if (!parsed) return send(msg.chat.id, 'Use: <code>/adminadd title | YYYY-MM-DD | none|monthly|yearly | 30,7,1</code>');
+  await ensureUser(msg);
+  const nextDue = computeNextDueDate(parsed.dueDate, parsed.recurrence);
+  const { error } = await supabase.from('admin_items').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, title: parsed.title, base_due_date: parsed.dueDate, next_due_date: nextDue, recurrence: parsed.recurrence, lead_days: parsed.leadDays, is_active: true, created_at: nowIso(), updated_at: nowIso() });
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not save admin item.'); }
+  return send(msg.chat.id, `Saved admin item:\n<b>${escapeHtml(parsed.title)}</b>\nDue: <b>${escapeHtml(nextDue)}</b>\nRecurrence: <b>${escapeHtml(parsed.recurrence)}</b>`, { reply_markup: MAIN_KEYBOARD });
+}
+async function findAdminItem(userId, keyword) {
+  const { data, error } = await supabase.from('admin_items').select('*').eq('telegram_user_id', userId).eq('is_active', true).ilike('title', `%${keyword}%`).order('next_due_date', { ascending: true }).limit(1);
+  if (error) throw error;
+  return data?.[0] || null;
+}
+async function completeAdminItem(chatId, row) {
+  if (!row) return send(chatId, 'Admin item not found.');
+  if (row.recurrence === 'none') {
+    const { error } = await supabase.from('admin_items').update({ is_active: false, updated_at: nowIso() }).eq('id', row.id);
+    if (error) throw error;
+    return send(chatId, `✅ Marked done: <b>${escapeHtml(row.title)}</b>\nNo further reminders for this item.`, { reply_markup: MAIN_KEYBOARD });
+  }
+  const nextDue = computeFollowingDueDate(row.next_due_date, row.recurrence);
+  const { error } = await supabase.from('admin_items').update({ base_due_date: nextDue, next_due_date: nextDue, updated_at: nowIso() }).eq('id', row.id);
+  if (error) throw error;
+  return send(chatId, `✅ Marked done: <b>${escapeHtml(row.title)}</b>\nNext due: <b>${escapeHtml(nextDue)}</b>`, { reply_markup: MAIN_KEYBOARD });
+}
+async function handleAdminDone(msg, keyword) {
+  if (!keyword) return send(msg.chat.id, 'Use: <code>/admindone keyword</code>');
+  await ensureUser(msg);
+  try {
+    const row = await findAdminItem(msg.from.id, keyword);
+    if (!row) return send(msg.chat.id, 'No active admin item matched that keyword.');
+    return completeAdminItem(msg.chat.id, row);
+  } catch (err) {
+    console.error(err);
+    return send(msg.chat.id, 'Could not mark admin item done.');
+  }
+}
+async function handleDue(msg, editContext = null) {
+  await ensureUser(msg);
+  try {
+    const { reminders, adminItems } = await getDueItems(msg.from.id);
+    const text = buildDueText(reminders, adminItems);
+    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: dueButtons(adminItems) }) : send(msg.chat.id, text, { reply_markup: dueButtons(adminItems) });
+  } catch (err) {
+    console.error(err);
+    return send(msg.chat.id, 'Could not load due items.');
+  }
+}
 
 async function handlePhvSettings(msg, editContext = null) {
   await ensureUser(msg);
   try {
     const settings = await getOrCreatePhvSettings(msg);
     const text = phvSettingsText(settings);
-    const opts = { reply_markup: phvSettingsButtons(settings) };
-    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, opts) : send(msg.chat.id, text, opts);
-  } catch (error) {
-    console.error(error);
+    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: phvSettingsButtons(settings) }) : send(msg.chat.id, text, { reply_markup: phvSettingsButtons(settings) });
+  } catch (err) {
+    console.error(err);
     return send(msg.chat.id, 'Could not load PHV settings.');
   }
 }
-
 async function handlePhvLog(msg, body) {
   const parsed = parsePhvBody(body);
-  if (!parsed) {
-    return send(msg.chat.id, 'Use: <code>/phvlog date:2026-03-27 | gross:145 | hours:2.5 | km:68 | petrol:18 | notes:airport run</code>');
-  }
+  if (!parsed) return send(msg.chat.id, 'Use: <code>/phvlog date:2026-03-27 | gross:145 | hours:2.5 | km:68 | petrol:18</code>');
   await ensureUser(msg);
-
   let settings = null;
   let autoPetrolUsed = false;
-  try {
-    settings = await getOrCreatePhvSettings(msg);
-  } catch (settingsError) {
-    console.error('phv settings load error', settingsError);
-  }
-
+  try { settings = await getOrCreatePhvSettings(msg); } catch (e) { console.error(e); }
   if ((parsed.petrol_cost === null || parsed.petrol_cost === undefined) && parsed.km_driven !== null && settings) {
     const autoPetrol = calculatePhvPetrolCost(parsed.km_driven, settings);
-    if (autoPetrol !== null) {
-      parsed.petrol_cost = autoPetrol;
-      autoPetrolUsed = true;
-    }
+    if (autoPetrol !== null) { parsed.petrol_cost = autoPetrol; autoPetrolUsed = true; }
   }
-
-  const { error } = await supabase.from('phv_logs').insert({
-    telegram_user_id: msg.from.id,
-    chat_id: msg.chat.id,
-    ...parsed,
-    created_at: nowIso(),
-    updated_at: nowIso(),
-  });
-
-  if (error) {
-    console.error(error);
-    return send(msg.chat.id, 'Could not save PHV log.');
-  }
-
-  const c = phvComputed(parsed);
+  const payload = { telegram_user_id: msg.from.id, chat_id: msg.chat.id, ...parsed, created_at: nowIso(), updated_at: nowIso() };
+  const { error } = await supabase.from('phv_logs').insert(payload);
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not save PHV log.'); }
+  const c = phvComputed(payload);
+  const allLogs = await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString());
+  const comparable = summarizeComparableSessions(allLogs, getDayType(parsed.log_date), parsed.log_date);
+  const score = scoreSession(c.hourlyNet);
   const lines = [
     '<b>PHV log saved</b>',
     `Date: <b>${escapeHtml(parsed.log_date)}</b>`,
-    `Gross: <b>${escapeHtml(currency(parsed.gross_amount))}</b>`,
-    `Hours: <b>${escapeHtml(String(parsed.hours_worked))}</b>`,
-    `Estimated net: <b>${escapeHtml(currency(c.net))}</b>`,
-    `Hourly gross: <b>${escapeHtml(currency(c.hourlyGross))}</b>`,
-    `Hourly net: <b>${escapeHtml(currency(c.hourlyNet))}</b>`,
+    `Gross: <b>${currency(c.gross)}</b>`,
+    `Petrol: <b>${currency(c.petrol)}</b>`,
+    `Net: <b>${currency(c.net)}</b>`,
+    `Hours: <b>${num(c.hours)}</b>`,
+    `Hourly net: <b>${currency(c.hourlyNet)}</b>`,
+    `Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
   ];
-  if (parsed.km_driven !== null) lines.push(`KM: <b>${escapeHtml(String(parsed.km_driven))}</b>`);
-  if (parsed.petrol_cost !== null) lines.push(`Petrol: <b>${escapeHtml(currency(parsed.petrol_cost))}</b>`);
-  if (autoPetrolUsed) lines.push(`Petrol source: <b>auto-filled from PHV settings (${escapeHtml(settings.mode || 'simple')} mode)</b>`);
-
-  await send(msg.chat.id, lines.join('\n'), { reply_markup: {
-    inline_keyboard: [
-      [
-        { text: '🚗 PHV Today', callback_data: 'show:phvtoday' },
-        { text: '📈 PHV Week', callback_data: 'show:phvweek' },
-      ],
-    ],
-  }});
+  if (parsed.km_driven !== null) lines.push(`KM: <b>${num(parsed.km_driven)}</b>`);
+  if (autoPetrolUsed) lines.push(`Petrol source: <b>auto-filled from PHV settings</b>`);
+  lines.push(`Signal: <b>${escapeHtml(buildStopRecommendation(payload, comparable))}</b>`);
+  return send(msg.chat.id, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }]] } });
 }
-
-async function handlePhvToday(msg, editContext = null) {
+async function handlePhvStart(msg, body = '') {
   await ensureUser(msg);
-  try {
-    const logs = await getPhvRange(msg.from.id, todayDateString(), todayDateString());
-    if (!logs.length) {
-      const text = 'No PHV logs for today yet.';
-      return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
-    }
-    const s = summarizePhv(logs);
-    const score = scoreSession(s.hourlyNet);
-    const lines = [
-      '<b>PHV today</b>',
-      `Date: <b>${escapeHtml(todayDateString())}</b>`,
-      `Trips logged: <b>${logs.length}</b>`,
-      `Gross: <b>${escapeHtml(currency(s.gross))}</b>`,
-      `Petrol: <b>${escapeHtml(currency(s.petrol))}</b>`,
-      `Estimated net: <b>${escapeHtml(currency(s.net))}</b>`,
-      `Hours: <b>${escapeHtml(s.hours.toFixed(2))}</b>`,
-      `Hourly gross: <b>${escapeHtml(currency(s.hourlyGross))}</b>`,
-      `Hourly net: <b>${escapeHtml(currency(s.hourlyNet))}</b>`,
-      `Score: <b>${escapeHtml(score.emoji + ' ' + score.label)}</b>`,
-      `Stop / continue: <b>${escapeHtml(buildStopRecommendation({ log_date: todayDateString(), hours_worked: s.hours, gross_amount: s.gross, petrol_cost: s.petrol }, summarizeComparableSessions(await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString()), getDayType(todayDateString()), todayDateString())).replace(/<[^>]+>/g,''))}</b>`,
-    ];
-    const opts = { reply_markup: { inline_keyboard: [[{ text: '📈 PHV Week', callback_data: 'show:phvweek' }, { text: '❓ Should I Drive', callback_data: 'show:shoulddrive' }], [{ text: '📅 Due', callback_data: 'show:due' }]] } };
-    return editContext ? editOrSend(msg.chat.id, editContext.messageId, lines.join('\n'), opts) : send(msg.chat.id, lines.join('\n'), opts);
-  } catch (error) {
-    console.error(error);
-    return send(msg.chat.id, 'Could not load PHV today summary.');
+  const existing = await getActiveSession(msg.from.id);
+  if (existing) return send(msg.chat.id, `You already have an active PHV session.\nStart mileage: <b>${num(existing.start_mileage, 0)}</b>\nStarted: <b>${escapeHtml(formatDateTime(existing.started_at))}</b>`);
+  const mileage = parseFloat(String(body || '').trim());
+  if (!Number.isFinite(mileage)) return send(msg.chat.id, 'Use: <code>/phvstart 112280</code>');
+  const { error } = await supabase.from('phv_active_session').upsert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, start_mileage: mileage, started_at: nowIso(), updated_at: nowIso() }, { onConflict: 'telegram_user_id' });
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not start PHV session.'); }
+  return send(msg.chat.id, `🚗 PHV session started\nStart mileage: <b>${num(mileage, 0)}</b>`, { reply_markup: { inline_keyboard: [[{ text: '📍 Mid Session', callback_data: 'show:phvnow' }, { text: '🏁 End Session', callback_data: 'show:phvend' }]] } });
+}
+async function handlePhvNow(msg, body) {
+  await ensureUser(msg);
+  const active = await getActiveSession(msg.from.id);
+  if (!active) return send(msg.chat.id, 'No active PHV session found. Use <code>/phvstart starting_mileage</code> first.');
+  const parsed = parsePhvNowBody(body);
+  if (!parsed) return send(msg.chat.id, 'Use: <code>/phvnow gross:62 | hours:1.8 | current:112314</code>');
+  const km = parsed.current_mileage - Number(active.start_mileage || 0);
+  if (!(km >= 0)) return send(msg.chat.id, 'Current mileage cannot be lower than start mileage.');
+  let petrol = parsed.petrol_cost;
+  if (petrol === null || petrol === undefined) {
+    const settings = await getOrCreatePhvSettings(msg);
+    petrol = calculatePhvPetrolCost(km, settings) ?? 0;
   }
+  const pseudo = { log_date: todayDateString(), gross_amount: parsed.gross_amount, hours_worked: parsed.hours_worked, petrol_cost: petrol };
+  const c = phvComputed(pseudo);
+  const allLogs = await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString());
+  const comparable = summarizeComparableSessions(allLogs, getDayType(todayDateString()), null);
+  const score = scoreSession(c.hourlyNet);
+  const lines = [
+    '<b>PHV mid-session</b>',
+    `KM so far: <b>${num(km)}</b>`,
+    `Gross so far: <b>${currency(parsed.gross_amount)}</b>`,
+    `Petrol est.: <b>${currency(petrol)}</b>`,
+    `Net so far: <b>${currency(c.net)}</b>`,
+    `Hours so far: <b>${num(parsed.hours_worked)}</b>`,
+    `Hourly net so far: <b>${currency(c.hourlyNet)}</b>`,
+    `Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
+    `Signal: <b>${escapeHtml(buildStopRecommendation(pseudo, comparable))}</b>`,
+  ];
+  return send(msg.chat.id, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '🏁 End Session', callback_data: 'show:phvend' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }]] } });
 }
-
-async function handlePhvWeek(msg, editContext = null) {
+async function handlePhvEnd(msg, body) {
   await ensureUser(msg);
-  try {
-    const start = todayDateString();
-    const sevenAgo = new Date(`${start}T12:00:00+08:00`);
-    sevenAgo.setDate(sevenAgo.getDate() - 6);
-    const startDate = sevenAgo.toISOString().slice(0, 10);
-    const logs = await getPhvRange(msg.from.id, startDate, todayDateString());
-    if (!logs.length) {
-      const text = 'No PHV logs in the past 7 days yet.';
-      return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
-    }
-    const s = summarizePhv(logs);
-    const bestDayMap = new Map();
-    logs.forEach((log) => {
-      const existing = bestDayMap.get(log.log_date) || { gross: 0, hours: 0, petrol: 0 };
-      existing.gross += Number(log.gross_amount || 0);
-      existing.hours += Number(log.hours_worked || 0);
-      existing.petrol += Number(log.petrol_cost || 0);
-      bestDayMap.set(log.log_date, existing);
-    });
-    let best = null;
-    for (const [date, data] of bestDayMap.entries()) {
-      const hourly = data.hours > 0 ? (data.gross - data.petrol) / data.hours : 0;
-      if (!best || hourly > best.hourly) best = { date, hourly };
-    }
-    const score = scoreSession(s.hourlyNet);
-    const split = compareWeekdayWeekend(logs);
-    const lines = [
-      '<b>PHV past 7 days</b>',
-      `Range: <b>${escapeHtml(startDate)}</b> to <b>${escapeHtml(todayDateString())}</b>`,
-      `Entries: <b>${logs.length}</b>`,
-      `Gross: <b>${escapeHtml(currency(s.gross))}</b>`,
-      `Petrol: <b>${escapeHtml(currency(s.petrol))}</b>`,
-      `Estimated net: <b>${escapeHtml(currency(s.net))}</b>`,
-      `Hours: <b>${escapeHtml(s.hours.toFixed(2))}</b>`,
-      `Avg hourly gross: <b>${escapeHtml(currency(s.hourlyGross))}</b>`,
-      `Avg hourly net: <b>${escapeHtml(currency(s.hourlyNet))}</b>`,
-      `Overall score: <b>${escapeHtml(score.emoji + ' ' + score.label)}</b>`,
-    ];
-    if (best) lines.push(`Best day by hourly net: <b>${escapeHtml(best.date)}</b> (${escapeHtml(currency(best.hourly))}/hr)`);
-    lines.push('', '<b>Weekday vs weekend</b>');
-    lines.push(`• Weekday avg hourly net: <b>${escapeHtml(currency(split.weekday.hourlyNet || 0))}</b> from <b>${escapeHtml(String(split.weekday.count || 0))}</b> log(s)`);
-    lines.push(`• Weekend avg hourly net: <b>${escapeHtml(currency(split.weekend.hourlyNet || 0))}</b> from <b>${escapeHtml(String(split.weekend.count || 0))}</b> log(s)`);
-    lines.push('', '<b>Interpretation</b>');
-    if ((split.weekday.count || 0) && (split.weekend.count || 0)) {
-      const better = Number(split.weekday.hourlyNet || 0) >= Number(split.weekend.hourlyNet || 0) ? 'Weekday sessions are currently stronger.' : 'Weekend sessions are currently stronger.';
-      lines.push(`• ${escapeHtml(better)}`);
-    } else {
-      lines.push('• Need more logs from both weekday and weekend to compare properly.');
-    }
-    const opts = { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '❓ Should I Drive', callback_data: 'show:shoulddrive' }], [{ text: '🗓 Weekly', callback_data: 'show:weekly' }]] } };
-    return editContext ? editOrSend(msg.chat.id, editContext.messageId, lines.join('\n'), opts) : send(msg.chat.id, lines.join('\n'), opts);
-  } catch (error) {
-    console.error(error);
-    return send(msg.chat.id, 'Could not load PHV week summary.');
+  const active = await getActiveSession(msg.from.id);
+  if (!active) return send(msg.chat.id, 'No active PHV session found. Use <code>/phvstart starting_mileage</code> first.');
+  const parsed = parsePhvEnd(body);
+  if (!parsed) return send(msg.chat.id, 'Use: <code>/phvend 112348 | gross:145 | hours:2.5</code>');
+  const km = parsed.end_mileage - Number(active.start_mileage || 0);
+  if (!(km >= 0)) return send(msg.chat.id, 'End mileage cannot be lower than start mileage.');
+  let petrol = parsed.petrol_cost;
+  let autoPetrol = false;
+  if (petrol === null || petrol === undefined) {
+    const settings = await getOrCreatePhvSettings(msg);
+    petrol = calculatePhvPetrolCost(km, settings) ?? 0;
+    autoPetrol = true;
   }
-}
-
-
-async function handleShouldDrive(msg, editContext = null) {
-  await ensureUser(msg);
-  try {
-    const start = addYears(todayDateString(), -1);
-    const logs = await getPhvRange(msg.from.id, start, todayDateString());
-    const dayType = getDayType(todayDateString());
-    const comparable = summarizeComparableSessions(logs, dayType, todayDateString());
-    const advice = buildShouldDriveAdvice(todayDateString(), comparable);
-    const lines = [
-      '<b>Should I drive today?</b>',
-      `Today type: <b>${escapeHtml(dayType)}</b>`,
-      `Comparable sessions used: <b>${escapeHtml(String(comparable.count || 0))}</b>`,
-      `Recent avg hourly net: <b>${escapeHtml(currency(comparable.hourlyNet || 0))}</b>`,
-      '',
-      `<b>${escapeHtml(advice.headline)}</b>`,
-      `• ${escapeHtml(advice.recommendation)}`,
-      `• Confidence: <b>${escapeHtml(advice.confidence)}</b>`,
-    ];
-    if (comparable.count > 0) {
-      lines.push(`• Recent avg net per session: <b>${escapeHtml(currency((comparable.net || 0) / comparable.count))}</b>`);
-      lines.push(`• Recent avg hours per session: <b>${escapeHtml(((comparable.hours || 0) / comparable.count).toFixed(2))}</b>`);
-    }
-    const opts = { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
-    return editContext ? editOrSend(msg.chat.id, editContext.messageId, lines.join('\n'), opts) : send(msg.chat.id, lines.join('\n'), opts);
-  } catch (error) {
-    console.error(error);
-    return send(msg.chat.id, 'Could not load should-drive insight.');
-  }
-}
-
-async function handleDecide(msg, body) {
-  if (!body) return send(msg.chat.id, 'Use: <code>/decide your situation or question</code>');
-  await ensureUser(msg);
-  const advice = buildDecisionAdvice(body);
-
-  const { error } = await supabase.from('decision_logs').insert({
+  const payload = {
     telegram_user_id: msg.from.id,
     chat_id: msg.chat.id,
-    prompt: body,
-    recommendation: advice.recommendation,
-    risk_level: advice.risk,
+    log_date: parsed.log_date,
+    gross_amount: parsed.gross_amount,
+    hours_worked: parsed.hours_worked,
+    km_driven: km,
+    petrol_cost: petrol,
+    start_mileage: Number(active.start_mileage),
+    end_mileage: parsed.end_mileage,
+    notes: parsed.notes,
     created_at: nowIso(),
-  });
-  if (error) console.error('decision log save error', error);
-
+    updated_at: nowIso(),
+  };
+  const { error: insertErr } = await supabase.from('phv_logs').insert(payload);
+  if (insertErr) { console.error(insertErr); return send(msg.chat.id, 'Could not save PHV session end log.'); }
+  const { error: delErr } = await supabase.from('phv_active_session').delete().eq('telegram_user_id', msg.from.id);
+  if (delErr) console.error(delErr);
+  const currentOdo = parsed.end_mileage;
+  const maintenanceItems = await getMaintenanceItems(msg.from.id);
+  const dueSoon = maintenanceItems.map((item) => ({ ...item, remaining: Number(item.next_due_mileage) - currentOdo })).filter((x) => x.remaining <= 1000).sort((a, b) => a.remaining - b.remaining).slice(0, 3);
+  const c = phvComputed(payload);
+  const allLogs = await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString());
+  const comparable = summarizeComparableSessions(allLogs, getDayType(payload.log_date), payload.log_date);
+  const score = scoreSession(c.hourlyNet);
   const lines = [
+    '<b>PHV session ended</b>',
+    `Start mileage: <b>${num(active.start_mileage, 0)}</b>`,
+    `End mileage: <b>${num(parsed.end_mileage, 0)}</b>`,
+    `Session KM: <b>${num(km)}</b>`,
+    `Gross: <b>${currency(payload.gross_amount)}</b>`,
+    `Petrol: <b>${currency(petrol)}</b>`,
+    `Net: <b>${currency(c.net)}</b>`,
+    `Hours: <b>${num(payload.hours_worked)}</b>`,
+    `Hourly net: <b>${currency(c.hourlyNet)}</b>`,
+    `Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
+    `Signal: <b>${escapeHtml(buildStopRecommendation(payload, comparable))}</b>`,
+  ];
+  if (autoPetrol) lines.push('Petrol source: <b>auto-filled from PHV settings</b>');
+  if (dueSoon.length) {
+    lines.push('', '<b>Maintenance watch</b>');
+    dueSoon.forEach((item) => {
+      const rem = Number(item.remaining);
+      const text = rem < 0 ? `${Math.abs(rem)} km overdue` : `${rem} km remaining`;
+      lines.push(`• ${escapeHtml(item.item_name)} — due at <b>${escapeHtml(String(item.next_due_mileage))}</b> (${escapeHtml(text)})`);
+    });
+  }
+  return send(msg.chat.id, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '🛠 Maintenance', callback_data: 'show:maintstatus' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }]] } });
+}
+async function handlePhvToday(msg, editContext = null) {
+  await ensureUser(msg);
+  const logs = await getPhvRange(msg.from.id, todayDateString(), todayDateString());
+  if (!logs.length) return editContext ? editOrSend(msg.chat.id, editContext.messageId, 'No PHV logs for today yet.', { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, 'No PHV logs for today yet.', { reply_markup: MAIN_KEYBOARD });
+  const s = summarizePhv(logs);
+  const score = scoreSession(s.hourlyNet);
+  const comparable = summarizeComparableSessions(await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString()), getDayType(todayDateString()), todayDateString());
+  const text = [
+    '<b>PHV today</b>',
+    `Entries: <b>${s.count}</b>`,
+    `Gross: <b>${currency(s.gross)}</b>`,
+    `Petrol: <b>${currency(s.petrol)}</b>`,
+    `Net: <b>${currency(s.net)}</b>`,
+    `Hours: <b>${num(s.hours)}</b>`,
+    `Hourly net: <b>${currency(s.hourlyNet)}</b>`,
+    `Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
+    `Signal: <b>${escapeHtml(buildStopRecommendation({ log_date: todayDateString(), gross_amount: s.gross, petrol_cost: s.petrol, hours_worked: s.hours }, comparable))}</b>`,
+  ].join('\n');
+  const opts = { reply_markup: { inline_keyboard: [[{ text: '📈 PHV Week', callback_data: 'show:phvweek' }, { text: '❓ Should I Drive', callback_data: 'show:shoulddrive' }]] } };
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, opts) : send(msg.chat.id, text, opts);
+}
+async function handlePhvWeek(msg, editContext = null) {
+  await ensureUser(msg);
+  const end = todayDateString();
+  const start = addDays(end, -6);
+  const logs = await getPhvRange(msg.from.id, start, end);
+  if (!logs.length) return editContext ? editOrSend(msg.chat.id, editContext.messageId, 'No PHV logs in the past 7 days yet.', { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, 'No PHV logs in the past 7 days yet.', { reply_markup: MAIN_KEYBOARD });
+  const s = summarizePhv(logs);
+  const score = scoreSession(s.hourlyNet);
+  const weekday = summarizePhv(logs.filter((x) => getDayType(x.log_date) === 'weekday'));
+  const weekend = summarizePhv(logs.filter((x) => getDayType(x.log_date) === 'weekend'));
+  const text = [
+    '<b>PHV past 7 days</b>',
+    `Range: <b>${escapeHtml(start)}</b> to <b>${escapeHtml(end)}</b>`,
+    `Entries: <b>${s.count}</b>`,
+    `Gross: <b>${currency(s.gross)}</b>`,
+    `Petrol: <b>${currency(s.petrol)}</b>`,
+    `Net: <b>${currency(s.net)}</b>`,
+    `Hours: <b>${num(s.hours)}</b>`,
+    `Avg hourly net: <b>${currency(s.hourlyNet)}</b>`,
+    `Overall score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
+    '',
+    '<b>Weekday vs weekend</b>',
+    `• Weekday avg hourly net: <b>${currency(weekday.hourlyNet)}</b> from <b>${weekday.count}</b> log(s)`,
+    `• Weekend avg hourly net: <b>${currency(weekend.hourlyNet)}</b> from <b>${weekend.count}</b> log(s)`,
+  ].join('\n');
+  const opts = { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '❓ Should I Drive', callback_data: 'show:shoulddrive' }], [{ text: '🛠 Maintenance', callback_data: 'show:maintstatus' }]] } };
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, opts) : send(msg.chat.id, text, opts);
+}
+async function handleShouldDrive(msg, editContext = null) {
+  await ensureUser(msg);
+  const logs = await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString());
+  const dayType = getDayType(todayDateString());
+  const comparable = summarizeComparableSessions(logs, dayType, todayDateString());
+  const advice = buildShouldDriveAdvice(dayType, comparable);
+  const text = [
+    '<b>Should I drive today?</b>',
+    `Today type: <b>${escapeHtml(dayType)}</b>`,
+    `Comparable sessions used: <b>${comparable.count}</b>`,
+    `Recent avg hourly net: <b>${currency(comparable.hourlyNet)}</b>`,
+    '',
+    `<b>${escapeHtml(advice.headline)}</b>`,
+    `• ${escapeHtml(advice.recommendation)}`,
+    `• Confidence: <b>${escapeHtml(advice.confidence)}</b>`,
+  ].join('\n');
+  const opts = { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, opts) : send(msg.chat.id, text, opts);
+}
+
+function buildDecisionAdvice(prompt) {
+  const text = String(prompt || '').toLowerCase();
+  const isDelay = /(wait|later|delay|postpone)/.test(text);
+  const isRepair = /(repair|service|servicing|fix)/.test(text);
+  const isBuy = /(buy|purchase|spend)/.test(text);
+  let recommendation = 'Take the lower-regret option that protects cashflow and avoids avoidable risk.';
+  let risk = 'Medium';
+  const reasons = ['Check urgency, cash impact, and downside if you wait.', 'Prefer reversible decisions when the facts are unclear.'];
+  const actions = ['List the cost now vs cost later.', 'Set a clear review date if you delay.'];
+  if (isRepair && isDelay) {
+    recommendation = 'Delay only if the issue is non-safety-critical and the downside of waiting is small.';
+    risk = 'Medium';
+  } else if (isRepair) {
+    recommendation = 'Do the repair/service now if it protects safety, reliability, or prevents larger future cost.';
+    risk = 'Low to medium';
+  } else if (isBuy) {
+    recommendation = 'Buy only if it solves a real recurring problem or clearly saves time/money.';
+    risk = 'Medium';
+  }
+  return { recommendation, risk, reasons, actions };
+}
+async function handleDecide(msg, body) {
+  if (!body) return send(msg.chat.id, 'Use: <code>/decide your question</code>');
+  await ensureUser(msg);
+  const advice = buildDecisionAdvice(body);
+  await supabase.from('decision_logs').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, prompt: body, recommendation: advice.recommendation, risk_level: advice.risk, created_at: nowIso() });
+  return send(msg.chat.id, [
     '<b>Decision assistant</b>',
     `<b>Your question</b>\n<blockquote>${escapeHtml(body)}</blockquote>`,
     '',
     `<b>Recommendation</b>\n• ${escapeHtml(advice.recommendation)}`,
     '',
     `<b>Risk level</b>\n• ${escapeHtml(advice.risk)}`,
-    '',
-    '<b>Why</b>',
-    ...advice.reasons.map((r) => `• ${escapeHtml(r)}`),
-    '',
-    '<b>Suggested next step</b>',
-    ...advice.actions.map((a) => `• ${escapeHtml(a)}`),
-  ];
-
-  await send(msg.chat.id, lines.join('\n'), { reply_markup: {
-    inline_keyboard: [
-      [
-        { text: '📅 Due', callback_data: 'show:due' },
-        { text: '🗓 Weekly', callback_data: 'show:weekly' },
-      ],
-    ],
-  }});
+  ].join('\n'), { reply_markup: MAIN_KEYBOARD });
 }
 
 async function handleWeekly(msg, editContext = null) {
   await ensureUser(msg);
   const userId = msg.from.id;
   const today = todayDateString();
-  const sevenDaysAgo = new Date(`${today}T12:00:00+08:00`);
-  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-  const sevenIso = sevenDaysAgo.toISOString();
-  const startDate = sevenDaysAgo.toISOString().slice(0, 10);
-
-  const [notesRes, tasksRes, dueData, openTasks, phvLogs] = await Promise.all([
-    supabase.from('notes').select('id', { count: 'exact', head: true }).eq('telegram_user_id', userId).gte('created_at', sevenIso),
-    supabase.from('tasks').select('*').eq('telegram_user_id', userId).gte('created_at', sevenIso),
+  const start = addDays(today, -7);
+  const [notesRes, tasksRes, dueData, openTasks, phvLogs, maintenanceItems] = await Promise.all([
+    supabase.from('notes').select('id', { count: 'exact', head: true }).eq('telegram_user_id', userId).gte('created_at', `${start}T00:00:00+08:00`),
+    supabase.from('tasks').select('*').eq('telegram_user_id', userId).gte('created_at', `${start}T00:00:00+08:00`),
     getDueItems(userId),
     getOpenTasks(userId),
-    getPhvRange(userId, startDate, today),
+    getPhvRange(userId, start, today),
+    getMaintenanceItems(userId),
   ]);
-
-  if (notesRes.error || tasksRes.error) {
-    console.error(notesRes.error || tasksRes.error);
-    return send(msg.chat.id, 'Could not create weekly summary.');
-  }
-
+  if (notesRes.error || tasksRes.error) return send(msg.chat.id, 'Could not create weekly summary.');
   const tasks = tasksRes.data || [];
-  const doneCount = tasks.filter((t) => t.status === 'done').length;
-  const openCount = tasks.filter((t) => t.status === 'open').length;
+  const doneCount = tasks.filter((x) => x.status === 'done').length;
+  const openCount = tasks.filter((x) => x.status === 'open').length;
   const phv = summarizePhv(phvLogs);
-
-  const lines = [
+  const currentOdo = await getCurrentOdometer(userId);
+  const dueSoonMaint = currentOdo === null ? [] : maintenanceItems.map((x) => ({ ...x, remaining: Number(x.next_due_mileage) - Number(currentOdo) })).filter((x) => x.remaining <= 1000).slice(0, 3);
+  const text = [
     '<b>Weekly summary</b>',
     `Date: <b>${escapeHtml(today)}</b>`,
     '',
@@ -1271,30 +942,70 @@ async function handleWeekly(msg, editContext = null) {
     `• Admin items due / upcoming: ${dueData.adminItems.length}`,
     '',
     '<b>PHV</b>',
-    `• Gross past 7 days: ${escapeHtml(currency(phv.gross))}`,
-    `• Estimated net past 7 days: ${escapeHtml(currency(phv.net))}`,
-    `• Avg hourly net: ${escapeHtml(currency(phv.hourlyNet))}`,
+    `• Net past 7 days: ${currency(phv.net)}`,
+    `• Avg hourly net: ${currency(phv.hourlyNet)}`,
+    `• KM logged: ${num(phv.km)}`,
     '',
-    '<b>Top open tasks</b>',
+    '<b>Maintenance</b>',
+    currentOdo === null ? '• Current odometer not known yet. End one PHV session with mileage first.' : `• Latest odometer: ${num(currentOdo, 0)} km`,
   ];
+  dueSoonMaint.forEach((x) => text.push(`• ${escapeHtml(x.item_name)}: ${x.remaining < 0 ? `${Math.abs(x.remaining)} km overdue` : `${Math.round(x.remaining)} km remaining`}`));
+  text.push('', '<b>Top open tasks</b>');
+  if (openTasks.length) openTasks.slice(0, 5).forEach((t) => text.push(`• ${escapeHtml(t.content)}`)); else text.push('• None');
+  const opts = { reply_markup: { inline_keyboard: [[{ text: '📅 Due', callback_data: 'show:due' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }], [{ text: '🛠 Maintenance', callback_data: 'show:maintstatus' }]] } };
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text.join('\n'), opts) : send(msg.chat.id, text.join('\n'), opts);
+}
 
-  if (openTasks.length) openTasks.slice(0, 5).forEach((t) => lines.push(`• ${escapeHtml(t.content)}`));
-  else lines.push('• None');
-
-  lines.push('', '<b>Suggested next action</b>');
-  if (dueData.reminders.length || dueData.adminItems.length) lines.push('• Clear or review due items first with /due.');
-  else if (openTasks.length) lines.push('• Finish one open task today.');
-  else if (phvLogs.length) lines.push('• Review PHV score and stop signals to protect your hourly net.');
-  else lines.push('• Capture new ideas with note: or /note.');
-
-  const opts = { reply_markup: { inline_keyboard: [[{ text: '📅 Due', callback_data: 'show:due' }, { text: '🚗 PHV Week', callback_data: 'show:phvweek' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
-  return editContext ? editOrSend(msg.chat.id, editContext.messageId, lines.join('\n'), opts) : send(msg.chat.id, lines.join('\n'), opts);
+async function handleAddMaintenance(msg, body) {
+  const parsed = parseMaintenanceAdd(body);
+  if (!parsed) return send(msg.chat.id, 'Use: <code>/addmaintenance item | interval_km | last_done_mileage</code>');
+  await ensureUser(msg);
+  const nextDue = Number(parsed.last_done_mileage) + Number(parsed.interval_km);
+  const row = { telegram_user_id: msg.from.id, chat_id: msg.chat.id, item_name: parsed.item_name, interval_km: parsed.interval_km, last_done_mileage: parsed.last_done_mileage, next_due_mileage: nextDue, notes: parsed.notes, is_active: true, updated_at: nowIso(), created_at: nowIso() };
+  const { error } = await supabase.from('maintenance_items').upsert(row, { onConflict: 'telegram_user_id,item_name' });
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not save maintenance item.'); }
+  return send(msg.chat.id, `Saved maintenance item:\n<b>${escapeHtml(parsed.item_name)}</b>\nInterval: <b>${num(parsed.interval_km, 0)} km</b>\nLast done: <b>${num(parsed.last_done_mileage, 0)} km</b>\nNext due: <b>${num(nextDue, 0)} km</b>`, { reply_markup: { inline_keyboard: [[{ text: '🛠 View Maintenance', callback_data: 'show:maintstatus' }]] } });
+}
+async function handleMaintenance(msg, editContext = null) {
+  await ensureUser(msg);
+  const items = await getMaintenanceItems(msg.from.id);
+  if (!items.length) {
+    const text = 'No maintenance items yet. Add one with <code>/addmaintenance engine servicing | 8000 | 112000</code>';
+    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
+  }
+  const currentOdo = await getCurrentOdometer(msg.from.id);
+  const lines = ['<b>Maintenance status</b>'];
+  if (currentOdo !== null) lines.push(`Current odometer: <b>${num(currentOdo, 0)} km</b>`, ''); else lines.push('Current odometer: <b>not known yet</b>', '');
+  items.forEach((item) => {
+    const remaining = currentOdo === null ? null : Number(item.next_due_mileage) - Number(currentOdo);
+    const status = remaining === null ? `Due at ${num(item.next_due_mileage, 0)} km` : (remaining < 0 ? `${Math.abs(Math.round(remaining))} km overdue` : `${Math.round(remaining)} km remaining`);
+    lines.push(`• <b>${escapeHtml(item.item_name)}</b>`);
+    lines.push(`  Last done: ${num(item.last_done_mileage, 0)} km`);
+    lines.push(`  Next due: ${num(item.next_due_mileage, 0)} km`);
+    lines.push(`  Status: ${escapeHtml(status)}`);
+    lines.push('');
+  });
+  const buttons = { inline_keyboard: items.slice(0, 5).map((x) => [{ text: `✅ Done: ${x.item_name.slice(0, 20)}`, callback_data: `maintdonehint:${x.id}` }]).concat([[{ text: '🔄 Refresh', callback_data: 'show:maintstatus' }, { text: '🚗 Start Session', callback_data: 'show:phvstart' }]]) };
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, lines.join('\n').trim(), { reply_markup: buttons }) : send(msg.chat.id, lines.join('\n').trim(), { reply_markup: buttons });
+}
+async function handleMaintDone(msg, body) {
+  const parsed = parseMaintDone(body);
+  if (!parsed) return send(msg.chat.id, 'Use: <code>/maintdone item | mileage | optional_cost | optional_note</code>');
+  await ensureUser(msg);
+  const { data, error } = await supabase.from('maintenance_items').select('*').eq('telegram_user_id', msg.from.id).ilike('item_name', `%${parsed.item_name}%`).eq('is_active', true).limit(1);
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not find maintenance item.'); }
+  const item = data?.[0];
+  if (!item) return send(msg.chat.id, 'No maintenance item matched that keyword.');
+  const nextDue = Number(parsed.mileage) + Number(item.interval_km);
+  const { error: upErr } = await supabase.from('maintenance_items').update({ last_done_mileage: parsed.mileage, next_due_mileage: nextDue, updated_at: nowIso() }).eq('id', item.id);
+  if (upErr) { console.error(upErr); return send(msg.chat.id, 'Could not update maintenance item.'); }
+  await supabase.from('maintenance_history').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, maintenance_item_id: item.id, item_name: item.item_name, mileage: parsed.mileage, cost: parsed.cost, notes: parsed.notes, created_at: nowIso() });
+  return send(msg.chat.id, `✅ Maintenance marked done\nItem: <b>${escapeHtml(item.item_name)}</b>\nDone at: <b>${num(parsed.mileage, 0)} km</b>\nNext due: <b>${num(nextDue, 0)} km</b>`, { reply_markup: { inline_keyboard: [[{ text: '🛠 View Maintenance', callback_data: 'show:maintstatus' }]] } });
 }
 
 function parseNaturalLanguage(text) {
   const trimmed = String(text || '').trim();
   if (!trimmed) return null;
-
   let m;
   if ((m = trimmed.match(/^note\s*:\s*(.+)$/i))) return { type: 'note', body: m[1].trim(), noteType: 'note' };
   if ((m = trimmed.match(/^idea\s*:\s*(.+)$/i))) return { type: 'note', body: m[1].trim(), noteType: 'idea' };
@@ -1305,78 +1016,139 @@ function parseNaturalLanguage(text) {
   if ((m = trimmed.match(/^admin\s*:\s*(.+)$/i))) return { type: 'adminadd', body: m[1].trim() };
   if ((m = trimmed.match(/^admin done\s*:\s*(.+)$/i))) return { type: 'admindone', body: m[1].trim() };
   if ((m = trimmed.match(/^phv\s*:\s*(.+)$/i))) return { type: 'phvlog', body: m[1].trim() };
+  if ((m = trimmed.match(/^phv start\s*:\s*(.+)$/i))) return { type: 'phvstart', body: m[1].trim() };
+  if ((m = trimmed.match(/^phv now\s*:\s*(.+)$/i))) return { type: 'phvnow', body: m[1].trim() };
+  if ((m = trimmed.match(/^phv end\s*:\s*(.+)$/i))) return { type: 'phvend', body: m[1].trim() };
+  if ((m = trimmed.match(/^maintenance\s*:\s*(.+)$/i))) return { type: 'addmaintenance', body: m[1].trim() };
+  if ((m = trimmed.match(/^maintenance done\s*:\s*(.+)$/i))) return { type: 'maintdone', body: m[1].trim() };
   if (/^due$/i.test(trimmed)) return { type: 'due' };
   if (/^weekly$/i.test(trimmed)) return { type: 'weekly' };
   if (/^phv today$/i.test(trimmed)) return { type: 'phvtoday' };
   if (/^phv week$/i.test(trimmed)) return { type: 'phvweek' };
+  if (/^maintenance$/i.test(trimmed)) return { type: 'maintenance' };
   if (/^phv settings$/i.test(trimmed)) return { type: 'phvsettings' };
   if (/^(should i drive|drive today\??)$/i.test(trimmed)) return { type: 'shoulddrive' };
   return null;
 }
-
 async function handleNaturalLanguage(msg, parsed) {
   switch (parsed.type) {
-    case 'note':
-      return handleNote(msg, parsed.body, parsed.noteType || 'note');
-    case 'task':
-      return handleTask(msg, parsed.body);
-    case 'done':
-      return handleDone(msg, parsed.body);
-    case 'search':
-      return handleSearch(msg, parsed.body);
-    case 'decide':
-      return handleDecide(msg, parsed.body);
-    case 'adminadd':
-      return handleAdminAdd(msg, parsed.body);
-    case 'admindone':
-      return handleAdminDone(msg, parsed.body);
-    case 'due':
-      return handleDue(msg);
-    case 'weekly':
-      return handleWeekly(msg);
-    case 'phvlog':
-      return handlePhvLog(msg, parsed.body);
-    case 'phvtoday':
-      return handlePhvToday(msg);
-    case 'phvweek':
-      return handlePhvWeek(msg);
-    case 'phvsettings':
-      return handlePhvSettings(msg);
-    case 'shoulddrive':
-      return handleShouldDrive(msg);
-    default:
-      return send(msg.chat.id, 'Unknown input. Use /help');
+    case 'note': return handleNote(msg, parsed.body, parsed.noteType || 'note');
+    case 'task': return handleTask(msg, parsed.body);
+    case 'done': return handleDone(msg, parsed.body);
+    case 'search': return handleSearch(msg, parsed.body);
+    case 'decide': return handleDecide(msg, parsed.body);
+    case 'adminadd': return handleAdminAdd(msg, parsed.body);
+    case 'admindone': return handleAdminDone(msg, parsed.body);
+    case 'due': return handleDue(msg);
+    case 'weekly': return handleWeekly(msg);
+    case 'phvlog': return handlePhvLog(msg, parsed.body);
+    case 'phvstart': return handlePhvStart(msg, parsed.body);
+    case 'phvnow': return handlePhvNow(msg, parsed.body);
+    case 'phvend': return handlePhvEnd(msg, parsed.body);
+    case 'phvtoday': return handlePhvToday(msg);
+    case 'phvweek': return handlePhvWeek(msg);
+    case 'phvsettings': return handlePhvSettings(msg);
+    case 'shoulddrive': return handleShouldDrive(msg);
+    case 'maintenance': return handleMaintenance(msg);
+    case 'addmaintenance': return handleAddMaintenance(msg, parsed.body);
+    case 'maintdone': return handleMaintDone(msg, parsed.body);
+    default: return send(msg.chat.id, 'Unknown input. Use /help');
+  }
+}
+
+function extractReceiptFields(text) {
+  const clean = String(text || '').replace(/\r/g, '');
+  const amountMatches = [...clean.matchAll(/(?:s\$|\$|sgd\s*)\s?(\d{1,4}(?:\.\d{2})?)/ig)].map((m) => parseFloat(m[1]));
+  const looseAmounts = [...clean.matchAll(/\b(\d{1,4}\.\d{2})\b/g)].map((m) => parseFloat(m[1]));
+  const allAmounts = [...amountMatches, ...looseAmounts].filter((n) => Number.isFinite(n) && n > 0);
+  const bestAmount = allAmounts.length ? Math.max(...allAmounts) : null;
+  const mileageMatch = clean.match(/(?:odometer|mileage|km|odo)\D{0,10}(\d{4,7})/i) || clean.match(/\b(\d{5,7})\s?km\b/i);
+  const mileage = mileageMatch ? parseFloat(mileageMatch[1]) : null;
+  const dateMatch = clean.match(/(\d{4}-\d{2}-\d{2})/) || clean.match(/(\d{2}[\/\-]\d{2}[\/\-]\d{4})/);
+  return { amount: bestAmount, mileage, date: dateMatch ? dateMatch[1] : null, raw_text: clean.slice(0, 3000) };
+}
+async function runReceiptOcr(fileUrl) {
+  const worker = await Tesseract.createWorker('eng');
+  try {
+    const { data } = await worker.recognize(fileUrl);
+    return data.text || '';
+  } finally {
+    await worker.terminate();
+  }
+}
+async function handlePhotoReceipt(msg) {
+  await ensureUser(msg);
+  const photo = msg.photo?.[msg.photo.length - 1];
+  if (!photo) return;
+  try {
+    const file = await bot.getFile(photo.file_id);
+    const fileUrl = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+    await send(msg.chat.id, 'Reading the screenshot / receipt now. This can take a bit on free hosting.');
+    const ocrText = await runReceiptOcr(fileUrl);
+    const fields = extractReceiptFields(ocrText);
+    const caption = String(msg.caption || '').toLowerCase();
+    const hint = caption.includes('fuel') ? 'fuel' : (caption.includes('maint') || caption.includes('service') ? 'maintenance' : (caption.includes('insur') ? 'insurance' : 'general'));
+    const { data: saved, error } = await supabase.from('receipt_scans').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, source_hint: hint, ocr_text: fields.raw_text, amount: fields.amount, mileage: fields.mileage, parsed_date: fields.date, created_at: nowIso() }).select('*').single();
+    if (error) throw error;
+    pendingReceiptActions.set(msg.from.id, saved.id);
+    const lines = [
+      '<b>Receipt / screenshot read complete</b>',
+      `Hint: <b>${escapeHtml(hint)}</b>`,
+      `Amount found: <b>${fields.amount !== null ? currency(fields.amount) : 'not found'}</b>`,
+      `Mileage found: <b>${fields.mileage !== null ? `${num(fields.mileage, 0)} km` : 'not found'}</b>`,
+      `Date found: <b>${escapeHtml(fields.date || 'not found')}</b>`,
+      '',
+      '<b>OCR preview</b>',
+      `<blockquote>${escapeHtml((fields.raw_text || '').slice(0, 500) || 'No text extracted.')}</blockquote>`,
+      '',
+      'Choose what you want to do with this receipt:',
+    ];
+    return send(msg.chat.id, lines.join('\n'), {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '⛽ Save Fuel Expense', callback_data: `receipt:fuel:${saved.id}` }, { text: '🛠 Save Maintenance Done', callback_data: `receipt:maintenance:${saved.id}` }],
+          [{ text: '📅 Save Admin Item', callback_data: `receipt:admin:${saved.id}` }, { text: '🗑 Ignore', callback_data: `receipt:ignore:${saved.id}` }],
+        ],
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    return send(msg.chat.id, 'Could not read that screenshot. Try a clearer image with larger text.');
   }
 }
 
 async function routeMessage(msg) {
+  if (msg.photo?.length) return handlePhotoReceipt(msg);
   if (!msg.text) return;
   const text = msg.text.trim();
 
-  const pending = pendingPhvSettingInputs.get(msg.from.id);
+  const pending = pendingInputs.get(msg.from.id);
   if (pending && !text.startsWith('/')) {
-    const value = Number(text.replace(/[^0-9.\-]/g, ''));
-    if (!Number.isFinite(value)) {
-      return send(msg.chat.id, 'Please send a number only. Example: <code>3.46</code>');
+    if (pending.kind === 'phvsetting') {
+      const value = Number(text.replace(/[^0-9.\-]/g, ''));
+      if (!Number.isFinite(value)) return send(msg.chat.id, 'Please send a number only. Example: <code>3.46</code>');
+      const { error } = await supabase.from('phv_settings').update({ [pending.field]: value, updated_at: nowIso() }).eq('telegram_user_id', msg.from.id);
+      pendingInputs.delete(msg.from.id);
+      if (error) { console.error(error); return send(msg.chat.id, 'Could not update PHV setting.'); }
+      await send(msg.chat.id, `Updated <b>${escapeHtml(pending.field)}</b> to <b>${escapeHtml(String(value))}</b>.`);
+      return handlePhvSettings(msg);
     }
-
-    const updates = { updated_at: nowIso() };
-    updates[pending.field] = value;
-
-    const { error } = await supabase
-      .from('phv_settings')
-      .update(updates)
-      .eq('telegram_user_id', msg.from.id);
-
-    pendingPhvSettingInputs.delete(msg.from.id);
-
-    if (error) {
-      console.error(error);
-      return send(msg.chat.id, 'Could not update that PHV setting.');
+    if (pending.kind === 'phvstart') {
+      pendingInputs.delete(msg.from.id);
+      return handlePhvStart(msg, text);
     }
-
-    await send(msg.chat.id, `Updated <b>${escapeHtml(pending.field)}</b> to <b>${escapeHtml(String(value))}</b>.`);
-    return handlePhvSettings(msg);
+    if (pending.kind === 'phvnow') {
+      pendingInputs.delete(msg.from.id);
+      return handlePhvNow(msg, text);
+    }
+    if (pending.kind === 'phvend') {
+      pendingInputs.delete(msg.from.id);
+      return handlePhvEnd(msg, text);
+    }
+    if (pending.kind === 'maintdone') {
+      pendingInputs.delete(msg.from.id);
+      return handleMaintDone(msg, text);
+    }
   }
 
   const natural = parseNaturalLanguage(text);
@@ -1384,169 +1156,140 @@ async function routeMessage(msg) {
 
   const [command, ...rest] = text.split(' ');
   const body = rest.join(' ').trim();
-
   switch (command.toLowerCase()) {
-    case '/start':
-      return handleStart(msg);
+    case '/start': return handleStart(msg);
     case '/help':
-    case '/menu':
-      return showHelp(msg.chat.id);
-    case '/note':
-      return handleNote(msg, body, 'note');
-    case '/idea':
-      return handleNote(msg, body, 'idea');
-    case '/task':
-      return handleTask(msg, body);
-    case '/done':
-      return handleDone(msg, body);
-    case '/remind':
-      return handleRemind(msg, body);
-    case '/adminadd':
-      return handleAdminAdd(msg, body);
-    case '/admindone':
-      return handleAdminDone(msg, body);
-    case '/due':
-      return handleDue(msg);
-    case '/search':
-      return handleSearch(msg, body);
-    case '/weekly':
-      return handleWeekly(msg);
-    case '/phvlog':
-      return handlePhvLog(msg, body);
-    case '/phvtoday':
-      return handlePhvToday(msg);
-    case '/phvweek':
-      return handlePhvWeek(msg);
-    case '/phvsettings':
-      return handlePhvSettings(msg);
-    case '/shoulddrive':
-      return handleShouldDrive(msg);
-    case '/decide':
-      return handleDecide(msg, body);
-    default:
-      return send(msg.chat.id, 'Unknown command. Use /help', { reply_markup: MAIN_KEYBOARD });
+    case '/menu': return showHelp(msg.chat.id);
+    case '/note': return handleNote(msg, body, 'note');
+    case '/idea': return handleNote(msg, body, 'idea');
+    case '/task': return handleTask(msg, body);
+    case '/done': return handleDone(msg, body);
+    case '/search': return handleSearch(msg, body);
+    case '/remind': return handleRemind(msg, body);
+    case '/adminadd': return handleAdminAdd(msg, body);
+    case '/admindone': return handleAdminDone(msg, body);
+    case '/due': return handleDue(msg);
+    case '/weekly': return handleWeekly(msg);
+    case '/phvlog': return handlePhvLog(msg, body);
+    case '/phvstart': return handlePhvStart(msg, body);
+    case '/phvnow': return handlePhvNow(msg, body);
+    case '/phvend': return handlePhvEnd(msg, body);
+    case '/phvtoday': return handlePhvToday(msg);
+    case '/phvweek': return handlePhvWeek(msg);
+    case '/phvsettings': return handlePhvSettings(msg);
+    case '/shoulddrive': return handleShouldDrive(msg);
+    case '/decide': return handleDecide(msg, body);
+    case '/addmaintenance': return handleAddMaintenance(msg, body);
+    case '/maintenance':
+    case '/maintstatus': return handleMaintenance(msg);
+    case '/maintdone': return handleMaintDone(msg, body);
+    default: return showHelp(msg.chat.id);
   }
 }
 
 async function routeCallback(query) {
-  const data = query.data || '';
   const msg = query.message;
-  if (!msg) return answerCallback(query.id);
-
-  const fauxMsg = { chat: msg.chat, from: query.from, text: '', message_id: msg.message_id };
-
+  const fauxMsg = { chat: msg.chat, from: query.from };
+  const data = query.data || '';
   try {
-    if (data === 'show:menu') {
-      await answerCallback(query.id);
-      return editOrSend(msg.chat.id, msg.message_id, 'Choose an action.', { reply_markup: MAIN_KEYBOARD });
+    if (data === 'show:menu') return showHelp(msg.chat.id);
+    if (data === 'show:due') return handleDue(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:weekly') return handleWeekly(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:phvtoday') return handlePhvToday(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:phvweek') return handlePhvWeek(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:phvsettings') return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:shoulddrive') return handleShouldDrive(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:maintstatus') return handleMaintenance(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:phvstart') {
+      pendingInputs.set(query.from.id, { kind: 'phvstart' });
+      return send(msg.chat.id, 'Send your starting mileage. Example: <code>112280</code>');
     }
-    if (data === 'show:due') {
-      await answerCallback(query.id);
-      return handleDue(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:phvnow') {
+      pendingInputs.set(query.from.id, { kind: 'phvnow' });
+      return send(msg.chat.id, 'Send: <code>gross:62 | hours:1.8 | current:112314</code>');
     }
-    if (data === 'show:weekly') {
-      await answerCallback(query.id);
-      return handleWeekly(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:phvend') {
+      pendingInputs.set(query.from.id, { kind: 'phvend' });
+      return send(msg.chat.id, 'Send: <code>112348 | gross:145 | hours:2.5</code>');
     }
-    if (data === 'show:phvtoday') {
-      await answerCallback(query.id);
-      return handlePhvToday(fauxMsg, { messageId: msg.message_id });
+    if (data === 'hint:note') return send(msg.chat.id, 'Send a note like: <code>note: check tyre pressure</code>');
+    if (data === 'hint:task') return send(msg.chat.id, 'Send a task like: <code>task: renew road tax</code>');
+    if (data.startsWith('admindoneid:')) {
+      const id = data.split(':')[1];
+      const { data: row, error } = await supabase.from('admin_items').select('*').eq('id', id).maybeSingle();
+      if (error) throw error;
+      return completeAdminItem(msg.chat.id, row);
     }
-    if (data === 'show:phvweek') {
-      await answerCallback(query.id);
-      return handlePhvWeek(fauxMsg, { messageId: msg.message_id });
+    if (data.startsWith('maintdonehint:')) {
+      const id = data.split(':')[1];
+      const { data: row, error } = await supabase.from('maintenance_items').select('*').eq('id', id).maybeSingle();
+      if (error) throw error;
+      pendingInputs.set(query.from.id, { kind: 'maintdone' });
+      return send(msg.chat.id, `Send: <code>${escapeHtml(row.item_name)} | 120000 | optional_cost | optional_note</code>`);
     }
-    if (data === 'show:phvsettings') {
-      await answerCallback(query.id);
-      return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
-    }
-    if (data === 'show:shoulddrive') {
-      await answerCallback(query.id);
-      return handleShouldDrive(fauxMsg);
-    }
-    if (data.startsWith('phvset:togglemode')) {
-      await answerCallback(query.id, 'Switching mode...');
+    if (data === 'phvset:togglemode') {
       const settings = await getOrCreatePhvSettings(fauxMsg);
       const nextMode = settings.mode === 'auto' ? 'simple' : 'auto';
       const { error } = await supabase.from('phv_settings').update({ mode: nextMode, updated_at: nowIso() }).eq('telegram_user_id', query.from.id);
       if (error) throw error;
       return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
     }
-    if (data.startsWith('phvset:edit:')) {
-      const field = data.split(':')[2];
-      pendingPhvSettingInputs.set(query.from.id, { field });
-      await answerCallback(query.id, 'Waiting for your value...');
-      return send(msg.chat.id, phvSettingPrompt(field), { reply_markup: phvSettingsButtons(await getOrCreatePhvSettings(fauxMsg)) });
+    if (data.startsWith('phvset:')) {
+      const field = data.split(':')[1];
+      pendingInputs.set(query.from.id, { kind: 'phvsetting', field });
+      return send(msg.chat.id, `Send the new value for <b>${escapeHtml(field)}</b>.`);
     }
-    if (data.startsWith('hint:')) {
-      const hint = data.split(':')[1];
-      await answerCallback(query.id);
-      const hints = {
-        note: 'Send: <code>note: your note here</code> or <code>/note your note here</code>',
-        task: 'Send: <code>task: your task here</code> or <code>/task your task here</code>',
-        decide: 'Send: <code>decide: should I service now or wait?</code> or <code>/decide ...</code>',
-      };
-      return send(msg.chat.id, hints[hint] || 'Use /help', { reply_markup: MAIN_KEYBOARD });
-    }
-    if (data.startsWith('admindone:')) {
-      const id = data.split(':')[1];
-      await answerCallback(query.id, 'Marking as done...');
-      const { data: row, error } = await supabase.from('admin_items').select('*').eq('id', id).limit(1).maybeSingle();
+    if (data.startsWith('receipt:')) {
+      const [, action, id] = data.split(':');
+      const { data: row, error } = await supabase.from('receipt_scans').select('*').eq('id', id).maybeSingle();
       if (error) throw error;
-      await completeAdminItemByRow(msg.chat.id, row);
-      return handleDue(fauxMsg, { messageId: msg.message_id });
+      if (!row) return send(msg.chat.id, 'Receipt record not found.');
+      if (action === 'ignore') {
+        await supabase.from('receipt_scans').update({ status: 'ignored' }).eq('id', id);
+        return send(msg.chat.id, 'Ignored that receipt.');
+      }
+      if (action === 'fuel') {
+        await supabase.from('receipt_scans').update({ status: 'saved_fuel' }).eq('id', id);
+        return send(msg.chat.id, `Saved as fuel reference. Amount found: <b>${row.amount !== null ? currency(row.amount) : 'not found'}</b>\nThis does not overwrite your PHV logs automatically.`);
+      }
+      if (action === 'maintenance') {
+        pendingInputs.set(query.from.id, { kind: 'maintdone' });
+        await supabase.from('receipt_scans').update({ status: 'maintenance_pending' }).eq('id', id);
+        return send(msg.chat.id, `Send maintenance save info in this format:\n<code>engine servicing | ${row.mileage || '120000'} | ${row.amount || ''} | from receipt</code>`);
+      }
+      if (action === 'admin') {
+        await supabase.from('receipt_scans').update({ status: 'admin_pending' }).eq('id', id);
+        return send(msg.chat.id, `Send admin item in this format:\n<code>insurance | ${row.parsed_date || todayDateString()} | yearly | 30,7,1</code>`);
+      }
     }
-    await answerCallback(query.id);
-  } catch (error) {
-    console.error('Callback handler error', error);
-    await answerCallback(query.id, 'Something went wrong.');
-    return send(msg.chat.id, 'Something went wrong while handling that button.');
+  } catch (err) {
+    console.error(err);
+    return send(msg.chat.id, 'That button action failed.');
   }
 }
 
-app.get('/', (_req, res) => {
-  res.status(200).send('Bot is running.');
-});
-
-app.get('/health', (_req, res) => {
-  res.status(200).json({ ok: true });
-});
-
-app.post(`/bot${TELEGRAM_BOT_TOKEN}`, async (req, res) => {
+app.get('/', (_req, res) => res.send('Bot is running.'));
+app.post(`/webhook/${TELEGRAM_BOT_TOKEN}`, async (req, res) => {
   try {
-    bot.processUpdate(req.body);
+    const update = req.body;
+    if (update.message) await routeMessage(update.message);
+    if (update.callback_query) {
+      await bot.answerCallbackQuery(update.callback_query.id).catch(() => {});
+      await routeCallback(update.callback_query);
+    }
     res.sendStatus(200);
-  } catch (error) {
-    console.error('Webhook route error', error);
-    res.sendStatus(500);
+  } catch (err) {
+    console.error(err);
+    res.sendStatus(200);
   }
 });
 
-bot.on('message', async (msg) => {
+(async function start() {
   try {
-    await routeMessage(msg);
-  } catch (error) {
-    console.error('Message handler error', error);
-    try {
-      await send(msg.chat.id, 'Something went wrong.');
-    } catch (inner) {
-      console.error('Fallback send error', inner);
-    }
+    await bot.setWebHook(`${WEBHOOK_URL}/webhook/${TELEGRAM_BOT_TOKEN}`);
+    app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+  } catch (err) {
+    console.error('Startup error', err);
+    process.exit(1);
   }
-});
-
-bot.on('callback_query', async (query) => {
-  await routeCallback(query);
-});
-
-async function start() {
-  await bot.setWebHook(`${WEBHOOK_URL}/bot${TELEGRAM_BOT_TOKEN}`);
-  app.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
-  });
-}
-
-start().catch((error) => {
-  console.error('Startup error', error);
-  process.exit(1);
-});
+})();
