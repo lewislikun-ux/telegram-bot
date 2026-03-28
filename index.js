@@ -176,8 +176,8 @@ const MAIN_KEYBOARD = {
       { text: '🛠 Maintenance', callback_data: 'show:maintstatus' },
     ],
     [
-      { text: '🏛 Grants', callback_data: 'show:grants' },
-      { text: '📢 Grant Updates', callback_data: 'show:grantupdates' },
+      { text: '📰 News', callback_data: 'show:newsmenu' },
+      { text: '🔄 Refresh News', callback_data: 'show:newsrefresh' },
     ],
   ],
 };
@@ -560,6 +560,7 @@ async function handleStart(msg) {
     '<code>/phvend 112348 | gross:145</code>',
     '<code>/addmaintenance engine servicing | 8000 | 112000</code>',
     '<code>/phvsettings</code>',
+    '<code>/news</code>',
   ].join('\n'), { reply_markup: MAIN_KEYBOARD });
 }
 async function showHelp(chatId) {
@@ -588,20 +589,19 @@ async function showHelp(chatId) {
     '<code>/phvweek</code>',
     '<code>/shoulddrive</code>',
     '<code>/phvsettings</code>',
+    '<code>/news</code>',
     '',
     '<b>Maintenance</b>',
     '<code>/addmaintenance item | interval_km | last_done_mileage</code>',
     '<code>/maintenance</code>',
     '<code>/maintdone item | mileage | optional_cost | optional_note</code>',
     '',
-    '<b>Grants intelligence</b>',
-    '<code>/grants</code>',
-    '<code>/support</code>',
-    '<code>/linkhub</code>',
-    '<code>/latestgrants</code>',
-    '<code>/industrygrant f&b</code>',
-    '<code>/matchgrant retail wants chatbot</code>',
+    '<b>News</b>',
     '<code>/gm</code>',
+    '<code>/news</code>',
+    '<code>/news world</code>',
+    '<code>/news singapore</code>',
+    '<code>/news business</code>',
     '',
     '<b>OCR</b>',
     'Send a receipt screenshot/photo with a caption like <code>fuel</code>, <code>maintenance</code>, or <code>insurance</code>. The bot will OCR it and suggest what to save.',
@@ -1108,10 +1108,10 @@ function parseNaturalLanguage(text) {
   if (/^phv settings$/i.test(trimmed)) return { type: 'phvsettings' };
   if (/^(should i drive|drive today\??)$/i.test(trimmed)) return { type: 'shoulddrive' };
   if (/^(good morning|gm)$/i.test(trimmed)) return { type: 'gm' };
-  if (/^(grants|grant directory)$/i.test(trimmed)) return { type: 'grants' };
-  if (/^(latest grants|grant updates)$/i.test(trimmed)) return { type: 'latestgrants' };
-  if (/^(support|supportable programmes)$/i.test(trimmed)) return { type: 'support' };
-  if (/^(link hub|linkhub)$/i.test(trimmed)) return { type: 'linkhub' };
+  if (/^(news|headlines)$/i.test(trimmed)) return { type: 'news', body: 'top' };
+  if (/^(world news)$/i.test(trimmed)) return { type: 'news', body: 'world' };
+  if (/^(singapore news|sg news)$/i.test(trimmed)) return { type: 'news', body: 'singapore' };
+  if (/^(business news)$/i.test(trimmed)) return { type: 'news', body: 'business' };
   return null;
 }
 async function handleNaturalLanguage(msg, parsed) {
@@ -1133,11 +1133,8 @@ async function handleNaturalLanguage(msg, parsed) {
     case 'phvweek': return handlePhvWeek(msg);
     case 'phvsettings': return handlePhvSettings(msg);
     case 'shoulddrive': return handleShouldDrive(msg);
-    case 'gm': return handleGrantDigest(msg);
-    case 'grants': return handleGrants(msg);
-    case 'latestgrants': return handleLatestGrants(msg);
-    case 'support': return handleSupport(msg);
-    case 'linkhub': return handleLinkHub(msg);
+    case 'gm': return handleGoodMorning(msg);
+    case 'news': return handleNewsCommand(msg, parsed.body || 'top');
     case 'maintenance': return handleMaintenance(msg);
     case 'addmaintenance': return handleAddMaintenance(msg, parsed.body);
     case 'maintdone': return handleMaintDone(msg, parsed.body);
@@ -1400,108 +1397,267 @@ async function buildPhvTodaySnapshotText(userId) {
   ].join('\n');
 }
 
-function decodeXmlEntities(text = '') {
-  return String(text)
+
+const NEWS_CACHE = new Map();
+const NEWS_CACHE_TTL_MS = 5 * 60 * 1000;
+const NEWS_PAGE_SIZE = 8;
+
+function getNewsCategoryConfig(category = 'top') {
+  const key = String(category || 'top').trim().toLowerCase();
+  if (key === 'world') {
+    return {
+      key: 'world',
+      label: '🌍 World',
+      url: 'https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-SG&gl=SG&ceid=SG:en'
+    };
+  }
+  if (key === 'singapore' || key === 'sg') {
+    return {
+      key: 'singapore',
+      label: '🇸🇬 Singapore',
+      url: 'https://news.google.com/rss/search?q=Singapore%20when%3A1d&hl=en-SG&gl=SG&ceid=SG:en'
+    };
+  }
+  if (key === 'business' || key === 'biz') {
+    return {
+      key: 'business',
+      label: '💼 Business',
+      url: 'https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-SG&gl=SG&ceid=SG:en'
+    };
+  }
+  return {
+    key: 'top',
+    label: '📰 Top News',
+    url: 'https://news.google.com/rss?hl=en-SG&gl=SG&ceid=SG:en'
+  };
+}
+
+function decodeXmlEntities(value = '') {
+  return String(value || '')
+    .replace(/<!\[CDATA\[(.*?)\]\]>/g, '$1')
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .trim();
+    .replace(/&#39;/g, "'");
 }
 
-function normalizeGoogleNewsUrl(url = '') {
-  const raw = String(url || '').trim();
-  if (!raw) return '';
-  if (raw.startsWith('./')) return `https://news.google.com/${raw.slice(2)}`;
-  if (raw.startsWith('/')) return `https://news.google.com${raw}`;
-  return raw;
+function stripHtmlTags(value = '') {
+  return String(value || '').replace(/<[^>]+>/g, '').trim();
 }
 
-function stripFeedSuffix(title = '') {
-  return String(title || '').replace(/\s+-\s+[^-]+$/, '').trim();
+function normalizeNewsUrl(url = '') {
+  return String(url || '').trim();
 }
 
-async function fetchLiveNewsItems(limit = 5) {
-  const sources = [
-    'https://news.google.com/rss?hl=en-SG&gl=SG&ceid=SG:en',
-    'https://www.channelnewsasia.com/rssfeeds/8395986'
-  ];
+function parseNewsItemsFromXml(xml, limit = 40) {
+  const items = [];
+  const seen = new Set();
+  const itemRegex = /<item>([\s\S]*?)<\/item>/gi;
+  let itemMatch;
+  while ((itemMatch = itemRegex.exec(xml)) && items.length < limit) {
+    const block = itemMatch[1] || '';
+    const titleMatch = block.match(/<title>([\s\S]*?)<\/title>/i);
+    const linkMatch = block.match(/<link>([\s\S]*?)<\/link>/i);
+    const pubDateMatch = block.match(/<pubDate>([\s\S]*?)<\/pubDate>/i);
+    const rawTitle = stripHtmlTags(decodeXmlEntities(titleMatch ? titleMatch[1] : ''));
+    const rawLink = decodeXmlEntities(linkMatch ? linkMatch[1] : '');
+    const rawDate = stripHtmlTags(decodeXmlEntities(pubDateMatch ? pubDateMatch[1] : ''));
+    const cleanedTitle = rawTitle.replace(/\s+-\s+[^-]+$/, '').trim();
+    const cleanedLink = normalizeNewsUrl(rawLink);
+    if (!cleanedTitle || !cleanedLink) continue;
+    const dedupeKey = `${cleanedTitle}||${cleanedLink}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    items.push({
+      title: cleanedTitle,
+      link: cleanedLink,
+      pubDate: rawDate
+    });
+  }
+  return items;
+}
 
-  for (const url of sources) {
-    try {
-      const response = await axios.get(url, {
-        timeout: 12000,
-        responseType: 'text',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 TelegramPersonalOpsBot/3.0'
-        }
-      });
-      const xml = String(response.data || '');
-      const items = [];
-      const itemRegex = /<item>([\s\S]*?)<\/item>/gi;
-      let itemMatch;
+async function fetchNewsItems(category = 'top', forceRefresh = false, limit = 40) {
+  const config = getNewsCategoryConfig(category);
+  const cacheKey = config.key;
+  const cached = NEWS_CACHE.get(cacheKey);
+  if (!forceRefresh && cached && (Date.now() - cached.fetchedAt < NEWS_CACHE_TTL_MS)) {
+    return cached.items.slice(0, limit);
+  }
+  try {
+    const response = await axios.get(config.url, { timeout: 12000, responseType: 'text' });
+    const xml = String(response.data || '');
+    const items = parseNewsItemsFromXml(xml, limit);
+    NEWS_CACHE.set(cacheKey, { items, fetchedAt: Date.now() });
+    return items;
+  } catch (err) {
+    console.error(`News fetch failed for ${config.key}:`, err.message);
+    if (cached) return cached.items.slice(0, limit);
+    return [];
+  }
+}
 
-      while ((itemMatch = itemRegex.exec(xml)) && items.length < limit) {
-        const block = itemMatch[1] || '';
-        const titleMatch = block.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/i) || block.match(/<title>(.*?)<\/title>/i);
-        const linkMatch = block.match(/<link>(.*?)<\/link>/i);
-        const rawTitle = decodeXmlEntities(titleMatch ? titleMatch[1] : '');
-        const rawLink = decodeXmlEntities(linkMatch ? linkMatch[1] : '');
-        const title = stripFeedSuffix(rawTitle);
-        const link = normalizeGoogleNewsUrl(rawLink);
-        if (!title || !link) continue;
-        if (items.some((x) => x.title === title || x.link === link)) continue;
-        items.push({ title, link });
-      }
-
-      if (items.length) return items.slice(0, limit);
-    } catch (err) {
-      console.error('Live news fetch failed:', err.message);
+function buildNewsSnapshotText(sectionMap) {
+  const lines = ['<b>📰 Live news</b>'];
+  const order = ['world', 'singapore', 'business'];
+  let total = 0;
+  order.forEach((key) => {
+    const config = getNewsCategoryConfig(key);
+    const items = (sectionMap && sectionMap[key]) || [];
+    lines.push('');
+    lines.push(`<b>${config.label}</b>`);
+    if (!items.length) {
+      lines.push('• News is temporarily unavailable.');
+      return;
     }
-  }
-
-  return [];
-}
-
-function buildNewsSnapshotText(items) {
-  const lines = ['<b>📰 News</b>'];
-  if (!items.length) {
-    lines.push('• News is temporarily unavailable.');
-    return lines.join('\n');
-  }
-  items.slice(0, 5).forEach((item) => {
-    lines.push(`• <a href="${escapeHtml(item.link)}">${escapeHtml(item.title)}</a>`);
+    items.slice(0, 3).forEach((item) => {
+      total += 1;
+      lines.push(`• <a href="${escapeHtml(item.link)}">${escapeHtml(item.title)}</a>`);
+    });
   });
-  lines.push('');
-  lines.push('Tap a headline to read more.');
+  if (!total) {
+    lines.push('');
+    lines.push('• News is temporarily unavailable.');
+  }
   return lines.join('\n');
 }
 
-async function handleGrantDigest(msg) {
+function buildNewsMenuKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '🌍 World', callback_data: 'news:world:1' },
+        { text: '🇸🇬 Singapore', callback_data: 'news:singapore:1' },
+        { text: '💼 Business', callback_data: 'news:business:1' },
+      ],
+      [
+        { text: '📰 Top', callback_data: 'news:top:1' },
+        { text: '🔄 Refresh', callback_data: 'show:newsrefresh' },
+      ]
+    ],
+  };
+}
+
+function buildNewsPageKeyboard(category, page, totalPages) {
+  const rows = [
+    [
+      { text: '🌍 World', callback_data: 'news:world:1' },
+      { text: '🇸🇬 Singapore', callback_data: 'news:singapore:1' },
+      { text: '💼 Business', callback_data: 'news:business:1' },
+    ]
+  ];
+  const nav = [];
+  if (page > 1) nav.push({ text: '⬅️ Prev', callback_data: `news:${category}:${page - 1}` });
+  if (page < totalPages) nav.push({ text: '➡️ Next', callback_data: `news:${category}:${page + 1}` });
+  if (nav.length) rows.push(nav);
+  rows.push([{ text: '🔄 Refresh', callback_data: `newsrefresh:${category}:${page}` }, { text: '📋 News Menu', callback_data: 'show:newsmenu' }]);
+  return { inline_keyboard: rows };
+}
+
+function buildNewsPageText(category, items, page) {
+  const config = getNewsCategoryConfig(category);
+  if (!items.length) {
+    return {
+      text: [
+        `<b>${config.label}</b>`,
+        '',
+        'No live news items are available right now.'
+      ].join('\n'),
+      totalPages: 1,
+      page: 1
+    };
+  }
+  const totalPages = Math.max(1, Math.ceil(items.length / NEWS_PAGE_SIZE));
+  const safePage = Math.min(Math.max(1, page), totalPages);
+  const start = (safePage - 1) * NEWS_PAGE_SIZE;
+  const pageItems = items.slice(start, start + NEWS_PAGE_SIZE);
+  const lines = [
+    `<b>${config.label}</b>`,
+    `Page <b>${safePage}</b> of <b>${totalPages}</b>`,
+    '',
+  ];
+  pageItems.forEach((item, index) => {
+    lines.push(`${start + index + 1}. <a href="${escapeHtml(item.link)}">${escapeHtml(item.title)}</a>`);
+    if (item.pubDate) lines.push(`   ${escapeHtml(item.pubDate)}`);
+  });
+  lines.push('');
+  lines.push('Tap the headline to read more.');
+  return {
+    text: lines.join('\n'),
+    totalPages,
+    page: safePage
+  };
+}
+
+async function handleNewsCommand(msg, body = 'top', editContext = null, forceRefresh = false) {
   await ensureUser(msg);
-  const [{ reminders, adminItems }, phvText, newsItems] = await Promise.all([
+  const category = getNewsCategoryConfig(body).key;
+  const items = await fetchNewsItems(category, forceRefresh, 40);
+  const pageData = buildNewsPageText(category, items, 1);
+  const extra = { reply_markup: buildNewsPageKeyboard(category, pageData.page, pageData.totalPages) };
+  return editContext
+    ? editOrSend(msg.chat.id, editContext.messageId, pageData.text, extra)
+    : send(msg.chat.id, pageData.text, extra);
+}
+
+async function handleNewsPage(msg, category = 'top', page = 1, editContext = null, forceRefresh = false) {
+  await ensureUser(msg);
+  const items = await fetchNewsItems(category, forceRefresh, 40);
+  const pageData = buildNewsPageText(category, items, page);
+  const extra = { reply_markup: buildNewsPageKeyboard(getNewsCategoryConfig(category).key, pageData.page, pageData.totalPages) };
+  return editContext
+    ? editOrSend(msg.chat.id, editContext.messageId, pageData.text, extra)
+    : send(msg.chat.id, pageData.text, extra);
+}
+
+async function handleNewsMenu(msg, editContext = null) {
+  await ensureUser(msg);
+  const text = [
+    '<b>📰 Live News Menu</b>',
+    '',
+    'Choose a section below to browse more headlines.',
+    'Each page shows more clickable headlines so you can choose what to read.'
+  ].join('\n');
+  return editContext
+    ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: buildNewsMenuKeyboard() })
+    : send(msg.chat.id, text, { reply_markup: buildNewsMenuKeyboard() });
+}
+
+async function handleGoodMorning(msg) {
+  await ensureUser(msg);
+  const [{ reminders, adminItems }, phvText, world, singapore, business] = await Promise.all([
     getDueItems(msg.from.id),
     buildPhvTodaySnapshotText(msg.from.id),
-    fetchLiveNewsItems(5),
+    fetchNewsItems('world', false, 12),
+    fetchNewsItems('singapore', false, 12),
+    fetchNewsItems('business', false, 12),
   ]);
   const lines = [
     '<b>Good morning ☀️</b>',
     '',
-    buildNewsSnapshotText(newsItems),
+    buildNewsSnapshotText({ world, singapore, business }),
     '',
     buildDueSnapshotText(reminders, adminItems),
     '',
     phvText,
   ];
-  return send(msg.chat.id, lines.join('\n'), { reply_markup: MAIN_KEYBOARD });
+  return send(msg.chat.id, lines.join('\n'), {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: '🌍 More World', callback_data: 'news:world:1' },
+          { text: '🇸🇬 More SG', callback_data: 'news:singapore:1' },
+        ],
+        [
+          { text: '💼 More Business', callback_data: 'news:business:1' },
+          { text: '📋 News Menu', callback_data: 'show:newsmenu' },
+        ]
+      ]
+    }
+  });
 }
 
-async function handleNews(msg) {
-  await ensureUser(msg);
-  const newsItems = await fetchLiveNewsItems(8);
-  return send(msg.chat.id, buildNewsSnapshotText(newsItems), { reply_markup: MAIN_KEYBOARD });
-}
 
 
 function extractReceiptFields(text) {
@@ -1626,14 +1782,8 @@ async function routeMessage(msg) {
     case '/phvweek': return handlePhvWeek(msg);
     case '/phvsettings': return handlePhvSettings(msg);
     case '/shoulddrive': return handleShouldDrive(msg);
-    case '/grants': return handleGrants(msg);
-    case '/support': return handleSupport(msg);
-    case '/linkhub': return handleLinkHub(msg);
-    case '/latestgrants': return handleLatestGrants(msg);
-    case '/industrygrant': return handleIndustryGrant(msg, body);
-    case '/matchgrant': return handleMatchGrant(msg, body);
-    case '/gm': return handleGrantDigest(msg);
-    case '/news': return handleNews(msg);
+    case '/news': return handleNewsCommand(msg, body || 'top');
+    case '/gm': return handleGoodMorning(msg);
     case '/decide': return handleDecide(msg, body);
     case '/addmaintenance': return handleAddMaintenance(msg, body);
     case '/maintenance':
@@ -1656,8 +1806,19 @@ async function routeCallback(query) {
     if (data === 'show:phvsettings') return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:shoulddrive') return handleShouldDrive(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:maintstatus') return handleMaintenance(fauxMsg, { messageId: msg.message_id });
-    if (data === 'show:grants') return handleGrants(fauxMsg, { messageId: msg.message_id });
-    if (data === 'show:grantupdates') return handleLatestGrants(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:newsmenu') return handleNewsMenu(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:newsrefresh') {
+      NEWS_CACHE.clear();
+      return handleNewsMenu(fauxMsg, { messageId: msg.message_id });
+    }
+    if (data.startsWith('newsrefresh:')) {
+      const [, category, pageRaw] = data.split(':');
+      return handleNewsPage(fauxMsg, category, parseInt(pageRaw || '1', 10) || 1, { messageId: msg.message_id }, true);
+    }
+    if (data.startsWith('news:')) {
+      const [, category, pageRaw] = data.split(':');
+      return handleNewsPage(fauxMsg, category, parseInt(pageRaw || '1', 10) || 1, { messageId: msg.message_id });
+    }
     if (data === 'show:phvstart') {
       pendingInputs.set(query.from.id, { kind: 'phvstart' });
       return send(msg.chat.id, 'Send your starting mileage. Example: <code>112280</code>');
