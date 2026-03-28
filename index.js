@@ -171,6 +171,10 @@ const MAIN_KEYBOARD = {
       { text: '🏛 Grants', callback_data: 'show:grants' },
       { text: '🆕 Grant Updates', callback_data: 'show:latestgrants' },
     ],
+    [
+      { text: '🏭 By Industry', callback_data: 'show:industryhelp' },
+      { text: '🔗 Link Hub', callback_data: 'show:linkhub' },
+    ],
   ],
 };
 
@@ -534,11 +538,13 @@ function phvSettingsText(settings) {
 }
 
 
-async function getGrantSupports(limit = 24) {
+
+async function getGrantSupports(limit = 40) {
   const { data, error } = await supabase
     .from('grants_master')
     .select('*')
     .eq('status', 'active')
+    .order('priority', { ascending: false, nullsFirst: false })
     .order('category', { ascending: true })
     .order('name', { ascending: true })
     .limit(limit);
@@ -549,6 +555,7 @@ async function getGrantUpdates(limit = 8) {
   const { data, error } = await supabase
     .from('grant_updates')
     .select('*')
+    .order('effective_date', { ascending: false, nullsFirst: false })
     .order('created_at', { ascending: false })
     .limit(limit);
   if (error) throw error;
@@ -563,66 +570,152 @@ function groupGrantSupports(items) {
   });
   return grouped;
 }
-function formatGrantSupportList(items, { title = '<b>Grants & Support</b>', compact = false } = {}) {
-  if (!items.length) return '<b>Grants & Support</b>\n\nNo active grant or programme records found yet.';
-  const grouped = groupGrantSupports(items);
-  const lines = [title, ''];
-  Object.keys(grouped).sort().forEach((category) => {
-    lines.push(`<b>${escapeHtml(category)}</b>`);
-    grouped[category].forEach((item) => {
-      lines.push(`• <b>${escapeHtml(item.name || 'Untitled')}</b>`);
-      if (item.description) lines.push(`  ${escapeHtml(item.description)}`);
-      if (!compact && item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
-    });
-    lines.push('');
-  });
-  return lines.join('\n').trim();
-}
-function formatGrantLinkHub(items) {
-  if (!items.length) return '<b>Grant Link Hub</b>\n\nNo active records found yet.';
-  const lines = ['<b>Grant Link Hub</b>', ''];
-  items.forEach((item) => {
-    lines.push(`• <b>${escapeHtml(item.name || 'Untitled')}</b>`);
-    if (item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
-  });
-  return lines.join('\n');
-}
-function formatGrantUpdates(updates) {
-  if (!updates.length) return '<b>Latest grant updates</b>\n\nNo update records found yet.';
-  const lines = ['<b>Latest grant updates</b>', ''];
-  updates.forEach((item) => {
-    lines.push(`• <b>${escapeHtml(item.title || 'Untitled update')}</b>`);
-    if (item.summary) lines.push(`  ${escapeHtml(item.summary)}`);
-    if (item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
-  });
-  return lines.join('\n');
-}
 function normalizeGrantKeyword(value) {
   return String(value || '').trim().toLowerCase();
 }
-function scoreGrantMatch(item, queryText) {
+const GRANT_INDUSTRY_ALIASES = {
+  'fnb': 'f&b',
+  'food and beverage': 'f&b',
+  'food': 'f&b',
+  'retail shop': 'retail',
+  'shop': 'retail',
+  'factory': 'manufacturing',
+  'maker': 'manufacturing',
+  'service': 'services',
+  'startup company': 'startup',
+  'new business': 'startup',
+};
+const GRANT_PROBLEM_PATTERNS = [
+  { tag: 'digitalisation', keywords: ['digital', 'software', 'system', 'crm', 'pos', 'erp', 'hr', 'accounting', 'qr ordering'] },
+  { tag: 'automation', keywords: ['automation', 'automate', 'chatbot', 'ai', 'analytics'] },
+  { tag: 'business transformation', keywords: ['branding', 'growth', 'transformation', 'consultancy', 'strategy', 'process'] },
+  { tag: 'overseas expansion', keywords: ['overseas', 'export', 'market entry', 'internationalisation', 'distributor'] },
+  { tag: 'energy saving', keywords: ['aircon', 'chiller', 'energy', 'utility', 'equipment', 'efficiency'] },
+  { tag: 'product development', keywords: ['product development', 'testing', 'shelf life', 'pilot', 'formulation'] },
+  { tag: 'workforce training', keywords: ['training', 'upskill', 'reskill', 'skillsfuture', 'course'] },
+];
+function grantArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+function grantSupportsIndustry(item, industry) {
+  if (!industry) return true;
+  const list = grantArray(item.industries).map(normalizeGrantKeyword);
+  return list.includes('all') || list.includes(normalizeGrantKeyword(industry));
+}
+function detectIndustryFromText(text) {
+  const q = normalizeGrantKeyword(text);
+  const aliasHit = Object.keys(GRANT_INDUSTRY_ALIASES).find((key) => q.includes(key));
+  if (aliasHit) return GRANT_INDUSTRY_ALIASES[aliasHit];
+  const candidates = ['f&b', 'retail', 'manufacturing', 'services', 'startup'];
+  return candidates.find((x) => q.includes(x)) || null;
+}
+function detectProblemTags(text) {
+  const q = normalizeGrantKeyword(text);
+  return GRANT_PROBLEM_PATTERNS
+    .filter((row) => row.keywords.some((kw) => q.includes(kw)))
+    .map((row) => row.tag);
+}
+function scoreGrantMatch(item, queryText, detectedIndustry = null, detectedTags = []) {
   const q = normalizeGrantKeyword(queryText);
   if (!q) return 0;
   let score = 0;
-  const keywords = Array.isArray(item.keywords) ? item.keywords : [];
+  const keywords = grantArray(item.keywords);
   keywords.forEach((kw) => {
     const k = normalizeGrantKeyword(kw);
     if (!k) return;
     if (q.includes(k)) score += Math.max(3, k.split(' ').length);
   });
-  const haystacks = [item.name, item.category, item.description].map((x) => normalizeGrantKeyword(x));
+  if (detectedIndustry && grantSupportsIndustry(item, detectedIndustry)) score += 4;
+  const itemTags = grantArray(item.problem_solved).map(normalizeGrantKeyword);
+  detectedTags.forEach((tag) => {
+    if (itemTags.includes(normalizeGrantKeyword(tag))) score += 4;
+  });
+  const haystacks = [item.name, item.category, item.description, item.support_type, item.agency].map((x) => normalizeGrantKeyword(x));
   haystacks.forEach((field) => {
     if (field && q.includes(field)) score += 2;
     else if (field && field.split(' ').some((token) => token && q.includes(token))) score += 1;
   });
+  if ((item.support_type || '').toLowerCase() === 'grant') score += 1;
+  if (Number.isFinite(Number(item.priority))) score += Number(item.priority) / 10;
   return score;
+}
+function formatGrantSupportLine(item, { includeWebpage = true, includeMeta = true } = {}) {
+  const lines = [`• <b>${escapeHtml(item.name || 'Untitled')}</b>`];
+  const meta = [];
+  if (includeMeta && item.support_type) meta.push(item.support_type);
+  if (includeMeta && item.agency) meta.push(item.agency);
+  if (meta.length) lines.push(`  ${escapeHtml(meta.join(' · '))}`);
+  if (item.description) lines.push(`  ${escapeHtml(item.description)}`);
+  if (item.eligibility_summary) lines.push(`  Who should use this: ${escapeHtml(item.eligibility_summary)}`);
+  if (includeWebpage && item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
+  return lines.join('
+');
+}
+function formatGrantSupportList(items, { title = '<b>Grants & Support</b>', compact = false } = {}) {
+  if (!items.length) return `${title}
+
+No active grant or programme records found yet.`;
+  const grouped = groupGrantSupports(items);
+  const lines = [title, ''];
+  Object.keys(grouped).sort().forEach((category) => {
+    lines.push(`<b>${escapeHtml(category)}</b>`);
+    grouped[category].forEach((item) => lines.push(formatGrantSupportLine(item, { includeWebpage: !compact, includeMeta: true })));
+    lines.push('');
+  });
+  return lines.join('
+').trim();
+}
+function formatGrantLinkHub(items) {
+  if (!items.length) return '<b>Grant Link Hub</b>
+
+No active records found yet.';
+  const grouped = groupGrantSupports(items);
+  const lines = ['<b>Grant Link Hub</b>', '', 'One-stop list of grants, programmes, FIRCs and IHL support links.', ''];
+  Object.keys(grouped).sort().forEach((category) => {
+    lines.push(`<b>${escapeHtml(category)}</b>`);
+    grouped[category].forEach((item) => {
+      lines.push(`• <b>${escapeHtml(item.name || 'Untitled')}</b>`);
+      if (item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
+    });
+    lines.push('');
+  });
+  return lines.join('
+').trim();
+}
+function formatGrantUpdates(updates) {
+  if (!updates.length) return '<b>Latest grant updates</b>
+
+No update records found yet.';
+  const lines = ['<b>Latest grant updates</b>', ''];
+  updates.forEach((item) => {
+    lines.push(`• <b>${escapeHtml(item.title || 'Untitled update')}</b>`);
+    if (item.summary) lines.push(`  ${escapeHtml(item.summary)}`);
+    if (item.client_angle) lines.push(`  Useful for clients: ${escapeHtml(item.client_angle)}`);
+    if (item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
+  });
+  return lines.join('
+');
+}
+function buildSupportStackFromMatches(matches) {
+  const buckets = {
+    funding: [],
+    execution: [],
+    capability: [],
+  };
+  matches.forEach((item) => {
+    const level = normalizeGrantKeyword(item.support_level || item.category);
+    if (level.includes('funding') || level.includes('grant') || (item.support_type || '').toLowerCase() === 'grant') buckets.funding.push(item);
+    else if (level.includes('execution') || level.includes('centre') || level.includes('programme')) buckets.execution.push(item);
+    else buckets.capability.push(item);
+  });
+  return buckets;
 }
 async function handleGrants(msg, editContext = null) {
   await ensureUser(msg);
   try {
     const items = await getGrantSupports();
     const text = formatGrantSupportList(items);
-    const extra = { reply_markup: { inline_keyboard: [[{ text: '🆕 Grant Updates', callback_data: 'show:latestgrants' }, { text: '🔗 Link Hub', callback_data: 'show:linkhub' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
+    const extra = { reply_markup: { inline_keyboard: [[{ text: '🆕 Grant Updates', callback_data: 'show:latestgrants' }, { text: '🔗 Link Hub', callback_data: 'show:linkhub' }], [{ text: '🏭 By Industry', callback_data: 'show:industryhelp' }, { text: '➕ Menu', callback_data: 'show:menu' }]] } };
     return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, extra) : send(msg.chat.id, text, extra);
   } catch (err) {
     console.error(err);
@@ -634,7 +727,7 @@ async function handleGrantUpdates(msg, editContext = null) {
   try {
     const updates = await getGrantUpdates();
     const text = formatGrantUpdates(updates);
-    const extra = { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🔗 Link Hub', callback_data: 'show:linkhub' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
+    const extra = { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🔗 Link Hub', callback_data: 'show:linkhub' }], [{ text: '🏭 By Industry', callback_data: 'show:industryhelp' }, { text: '➕ Menu', callback_data: 'show:menu' }]] } };
     return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, extra) : send(msg.chat.id, text, extra);
   } catch (err) {
     console.error(err);
@@ -646,12 +739,44 @@ async function handleGrantLinkHub(msg, editContext = null) {
   try {
     const items = await getGrantSupports();
     const text = formatGrantLinkHub(items);
-    const extra = { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🆕 Grant Updates', callback_data: 'show:latestgrants' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
+    const extra = { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🆕 Grant Updates', callback_data: 'show:latestgrants' }], [{ text: '🏭 By Industry', callback_data: 'show:industryhelp' }, { text: '➕ Menu', callback_data: 'show:menu' }]] } };
     return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, extra) : send(msg.chat.id, text, extra);
   } catch (err) {
     console.error(err);
     return send(msg.chat.id, 'Could not load the grant link hub.');
   }
+}
+async function handleIndustryGrant(msg, body, editContext = null) {
+  await ensureUser(msg);
+  const query = String(body || '').trim();
+  if (!query) return send(msg.chat.id, 'Use: <code>/industrygrant f&b</code> or <code>/industrygrant retail</code>');
+  try {
+    const items = await getGrantSupports(100);
+    const industry = detectIndustryFromText(query) || normalizeGrantKeyword(query);
+    const filtered = items.filter((item) => grantSupportsIndustry(item, industry));
+    if (!filtered.length) return send(msg.chat.id, `No support records found for industry: <b>${escapeHtml(query)}</b>`);
+    const text = formatGrantSupportList(filtered, { title: `<b>Support for ${escapeHtml(industry)}</b>`, compact: false });
+    const extra = { reply_markup: { inline_keyboard: [[{ text: '🔗 Link Hub', callback_data: 'show:linkhub' }, { text: '🏛 Grants', callback_data: 'show:grants' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
+    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, extra) : send(msg.chat.id, text, extra);
+  } catch (err) {
+    console.error(err);
+    return send(msg.chat.id, 'Could not load industry-specific support.');
+  }
+}
+async function handleIndustryGrantHelp(msg, editContext = null) {
+  const text = [
+    '<b>Industry lookup</b>',
+    'Use <code>/industrygrant industry</code>',
+    '',
+    'Examples:',
+    '• <code>/industrygrant f&b</code>',
+    '• <code>/industrygrant retail</code>',
+    '• <code>/industrygrant manufacturing</code>',
+    '• <code>/industrygrant services</code>',
+    '• <code>/industrygrant startup</code>',
+  ].join('
+');
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🔗 Link Hub', callback_data: 'show:linkhub' }]] } }) : send(msg.chat.id, text, { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🔗 Link Hub', callback_data: 'show:linkhub' }]] } });
 }
 async function handleMatchGrant(msg, body) {
   await ensureUser(msg);
@@ -659,11 +784,14 @@ async function handleMatchGrant(msg, body) {
   if (!query) return send(msg.chat.id, 'Use: <code>/matchgrant your client need</code>');
   try {
     const items = await getGrantSupports(100);
+    const detectedIndustry = detectIndustryFromText(query);
+    const detectedTags = detectProblemTags(query);
     const ranked = items
-      .map((item) => ({ item, score: scoreGrantMatch(item, query) }))
+      .map((item) => ({ item, score: scoreGrantMatch(item, query, detectedIndustry, detectedTags) }))
       .filter((x) => x.score > 0)
       .sort((a, b) => b.score - a.score)
-      .slice(0, 6);
+      .slice(0, 8)
+      .map((x) => x.item);
     if (!ranked.length) {
       return send(msg.chat.id, [
         '<b>Recommended support</b>',
@@ -671,21 +799,37 @@ async function handleMatchGrant(msg, body) {
         `Need: <blockquote>${escapeHtml(query)}</blockquote>`,
         'No direct match found yet in your grant dataset.',
         'Try adding more records into <code>grants_master</code> or use more specific keywords like <code>aircon</code>, <code>chiller</code>, <code>chatbot</code>, <code>overseas</code>, <code>POS</code>.',
-      ].join('\n'));
+      ].join('
+'));
     }
+    const stack = buildSupportStackFromMatches(ranked);
     const lines = [
-      '<b>Recommended support</b>',
+      '<b>Recommended support stack</b>',
       '',
       `Need: <blockquote>${escapeHtml(query)}</blockquote>`,
+      detectedIndustry ? `Industry detected: <b>${escapeHtml(detectedIndustry)}</b>` : null,
+      detectedTags.length ? `Problem tags: <b>${escapeHtml(detectedTags.join(', '))}</b>` : null,
       '',
-    ];
-    ranked.forEach(({ item }) => {
-      lines.push(`• <b>${escapeHtml(item.name || 'Untitled')}</b>`);
-      if (item.description) lines.push(`  ${escapeHtml(item.description)}`);
-      if (item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
+    ].filter(Boolean);
+    if (stack.funding.length) {
+      lines.push('<b>Funding layer</b>');
+      stack.funding.slice(0, 3).forEach((item) => lines.push(formatGrantSupportLine(item, { includeWebpage: true, includeMeta: true })));
       lines.push('');
-    });
-    return send(msg.chat.id, lines.join('\n').trim(), { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🆕 Grant Updates', callback_data: 'show:latestgrants' }]] } });
+    }
+    if (stack.execution.length) {
+      lines.push('<b>Execution / implementation layer</b>');
+      stack.execution.slice(0, 3).forEach((item) => lines.push(formatGrantSupportLine(item, { includeWebpage: true, includeMeta: true })));
+      lines.push('');
+    }
+    if (stack.capability.length) {
+      lines.push('<b>Capability / training layer</b>');
+      stack.capability.slice(0, 3).forEach((item) => lines.push(formatGrantSupportLine(item, { includeWebpage: true, includeMeta: true })));
+      lines.push('');
+    }
+    lines.push('<b>Why this stack works</b>');
+    lines.push('• Combines funding with execution support and capability-building where possible.');
+    return send(msg.chat.id, lines.join('
+').trim(), { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🏭 By Industry', callback_data: 'show:industryhelp' }], [{ text: '🆕 Grant Updates', callback_data: 'show:latestgrants' }]] } });
   } catch (err) {
     console.error(err);
     return send(msg.chat.id, 'Could not run grant matching.');
@@ -695,6 +839,8 @@ async function handleGrantMorning(msg) {
   await ensureUser(msg);
   try {
     const updates = await getGrantUpdates(5);
+    const items = await getGrantSupports(12);
+    const highPriority = items.filter((x) => Number(x.priority || 0) >= 80).slice(0, 3);
     const text = [
       'Good morning ☀️',
       '',
@@ -702,13 +848,20 @@ async function handleGrantMorning(msg) {
       ...(updates.length
         ? updates.map((item) => `• ${escapeHtml(item.title || 'Untitled update')}`)
         : ['• No new grant updates found yet.']),
-    ].join('\n');
-    return send(msg.chat.id, text, { reply_markup: { inline_keyboard: [[{ text: '🆕 Full Updates', callback_data: 'show:latestgrants' }, { text: '🏛 Grants', callback_data: 'show:grants' }]] } });
+      '',
+      '<b>Useful for clients today</b>',
+      ...(highPriority.length
+        ? highPriority.map((item) => `• ${escapeHtml(item.name)} — ${escapeHtml(item.description || '')}`)
+        : ['• Add high-priority records into <code>grants_master</code> to surface advisor picks here.']),
+    ].join('
+');
+    return send(msg.chat.id, text, { reply_markup: { inline_keyboard: [[{ text: '🆕 Full Updates', callback_data: 'show:latestgrants' }, { text: '🏛 Grants', callback_data: 'show:grants' }], [{ text: '🏭 By Industry', callback_data: 'show:industryhelp' }]] } });
   } catch (err) {
     console.error(err);
     return send(msg.chat.id, 'Could not build the grant morning digest.');
   }
 }
+
 
 async function handleStart(msg) {
   await ensureUser(msg);
@@ -722,7 +875,7 @@ async function handleStart(msg) {
     '• PHV start / now / end mileage flow',
     '• mileage-based maintenance tracker',
     '• screenshot / receipt OCR reader (best effort)',
-    '• grants / grant updates / grant matching',
+    '• grants / grant updates / grant matching / industry lookup',
     '',
     'Try:',
     '<code>/phvstart 112280</code>',
@@ -1280,6 +1433,8 @@ function parseNaturalLanguage(text) {
   if (/^(good morning|gm)$/i.test(trimmed)) return { type: 'grantmorning' };
   if (/^(grants|grant list)$/i.test(trimmed)) return { type: 'grants' };
   if (/^(latest grants|grant updates)$/i.test(trimmed)) return { type: 'latestgrants' };
+  if ((m = trimmed.match(/^(industry grants|support for)\s*:\s*(.+)$/i))) return { type: 'industrygrant', body: m[2].trim() };
+  if ((m = trimmed.match(/^industry\s+(.+)$/i))) return { type: 'industrygrant', body: m[1].trim() };
   if (/^(grant hub|link hub)$/i.test(trimmed)) return { type: 'linkhub' };
   return null;
 }
@@ -1304,6 +1459,7 @@ async function handleNaturalLanguage(msg, parsed) {
     case 'shoulddrive': return handleShouldDrive(msg);
     case 'grants': return handleGrants(msg);
     case 'latestgrants': return handleGrantUpdates(msg);
+    case 'industrygrant': return handleIndustryGrant(msg, parsed.body);
     case 'linkhub': return handleGrantLinkHub(msg);
     case 'grantmorning': return handleGrantMorning(msg);
     case 'maintenance': return handleMaintenance(msg);
@@ -1438,6 +1594,7 @@ async function routeMessage(msg) {
     case '/grants':
     case '/support': return handleGrants(msg);
     case '/latestgrants': return handleGrantUpdates(msg);
+    case '/industrygrant': return handleIndustryGrant(msg, body);
     case '/linkhub': return handleGrantLinkHub(msg);
     case '/matchgrant': return handleMatchGrant(msg, body);
     case '/gm': return handleGrantMorning(msg);
@@ -1465,6 +1622,7 @@ async function routeCallback(query) {
     if (data === 'show:maintstatus') return handleMaintenance(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:grants') return handleGrants(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:latestgrants') return handleGrantUpdates(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:industryhelp') return handleIndustryGrantHelp(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:linkhub') return handleGrantLinkHub(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:phvstart') {
       pendingInputs.set(query.from.id, { kind: 'phvstart' });
