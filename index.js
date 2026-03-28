@@ -1345,11 +1345,58 @@ async function handleMatchGrant(msg, body, editContext = null) {
   return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
 }
 
+function buildDueSnapshotText(reminders, adminItems) {
+  const lines = ['<b>📅 Due status</b>'];
+  if (!reminders.length && !adminItems.length) {
+    lines.push('• Nothing urgent right now.');
+    return lines.join('\n');
+  }
+  reminders.slice(0, 3).forEach((r) => {
+    lines.push(`• ${escapeHtml(formatDateTime(r.remind_at))} — ${escapeHtml(r.content)}`);
+  });
+  adminItems.slice(0, 3).forEach((a) => {
+    lines.push(`• ${escapeHtml(a.title)} — ${escapeHtml(a.next_due_date)} (${escapeHtml(humanDueLabel(dueInDays(a.next_due_date)))})`);
+  });
+  return lines.join('\n');
+}
+
+async function buildPhvTodaySnapshotText(userId) {
+  const logs = await getPhvRange(userId, todayDateString(), todayDateString());
+  if (!logs.length) return '<b>🚗 PHV status</b>\n• No PHV logs for today yet.';
+  const s = summarizePhv(logs);
+  const score = scoreSession(s.hourlyNet);
+  return [
+    '<b>🚗 PHV status</b>',
+    `• Gross: <b>${currency(s.gross)}</b>`,
+    `• Petrol: <b>${currency(s.petrol)}</b>`,
+    `• Net: <b>${currency(s.net)}</b>`,
+    `• Hours: <b>${num(s.hours)}</b>`,
+    `• Hourly net: <b>${currency(s.hourlyNet)}</b>`,
+    `• Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
+  ].join('\n');
+}
+
 async function handleGrantDigest(msg) {
-  const items = await getLatestGrantUpdates(5);
-  const lines = ['<b>Good morning ☀️</b>', '', '<b>🏛 Grants & Support</b>'];
+  await ensureUser(msg);
+  const [{ reminders, adminItems }, phvText, items] = await Promise.all([
+    getDueItems(msg.from.id),
+    buildPhvTodaySnapshotText(msg.from.id),
+    getLatestGrantUpdates(5),
+  ]);
+  const lines = [
+    '<b>Good morning ☀️</b>',
+    '',
+    buildDueSnapshotText(reminders, adminItems),
+    '',
+    phvText,
+    '',
+    '<b>🏛 Grants & Support</b>'
+  ];
   if (!items.length) lines.push('• No new grant updates found yet.');
-  items.forEach((item) => lines.push(`• ${escapeHtml(item.title)}`));
+  items.forEach((item) => {
+    lines.push(`• <b>${escapeHtml(item.title)}</b>`);
+    if (item.client_angle) lines.push(`  ${escapeHtml(item.client_angle)}`);
+  });
   return send(msg.chat.id, lines.join('\n'), { reply_markup: MAIN_KEYBOARD });
 }
 
@@ -1504,6 +1551,8 @@ async function routeCallback(query) {
     if (data === 'show:phvsettings') return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:shoulddrive') return handleShouldDrive(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:maintstatus') return handleMaintenance(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:grants') return handleGrants(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:grantupdates') return handleLatestGrants(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:phvstart') {
       pendingInputs.set(query.from.id, { kind: 'phvstart' });
       return send(msg.chat.id, 'Send your starting mileage. Example: <code>112280</code>');
