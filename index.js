@@ -1220,10 +1220,33 @@ function formatLinkHub(items) {
   return lines.join('\n');
 }
 
+function isMeaningfulGrantUpdate(item) {
+  const title = normalizeGrantText(item?.title || '');
+  const summary = normalizeGrantText(item?.summary || '');
+  if (!title && !summary) return false;
+  const placeholderTerms = [
+    'track new sme grant',
+    'use this table',
+    'support directory now includes',
+    'use /industrygrant',
+    'matchgrant now returns',
+    'grants intelligence layer'
+  ];
+  return !placeholderTerms.some((term) => title.includes(term) || summary.includes(term));
+}
+
 function formatGrantUpdatesText(items) {
-  if (!items.length) return 'No grant or programme updates found yet.';
+  const meaningful = (items || []).filter(isMeaningfulGrantUpdate);
+  if (!meaningful.length) {
+    return [
+      '<b>Latest Grants & Programme Updates</b>',
+      '',
+      'No useful grant updates saved yet.',
+      'Add real updates into <b>grant_updates</b> for this section to become useful.'
+    ].join('\n');
+  }
   const lines = ['<b>Latest Grants & Programme Updates</b>', ''];
-  items.forEach((item) => {
+  meaningful.forEach((item) => {
     lines.push(`• <b>${escapeHtml(item.title)}</b>`);
     if (item.summary) lines.push(`  ${escapeHtml(item.summary)}`);
     if (item.client_angle) lines.push(`  Useful for clients: ${escapeHtml(item.client_angle)}`);
@@ -1231,6 +1254,7 @@ function formatGrantUpdatesText(items) {
   });
   return lines.join('\n');
 }
+
 
 function scoreSupportMatch(item, queryText, industry) {
   const q = normalizeGrantText(queryText);
@@ -1376,29 +1400,68 @@ async function buildPhvTodaySnapshotText(userId) {
   ].join('\n');
 }
 
+async function fetchTopNewsHeadlines(limit = 5) {
+  const sources = [
+    'https://news.google.com/rss?hl=en-SG&gl=SG&ceid=SG:en',
+    'https://www.channelnewsasia.com/rssfeeds/8395986'
+  ];
+  for (const url of sources) {
+    try {
+      const response = await axios.get(url, { timeout: 10000, responseType: 'text' });
+      const xml = String(response.data || '');
+      const headlines = [];
+      const itemRegex = /<item>[\s\S]*?<title><!\[CDATA\[(.*?)\]\]><\/title>[\s\S]*?<\/item>|<item>[\s\S]*?<title>(.*?)<\/title>[\s\S]*?<\/item>/gi;
+      let match;
+      while ((match = itemRegex.exec(xml)) && headlines.length < limit) {
+        const raw = (match[1] || match[2] || '').trim();
+        if (!raw) continue;
+        const cleaned = raw
+          .replace(/&amp;/g, '&')
+          .replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>')
+          .replace(/\s+-\s+[^-]+$/, '')
+          .trim();
+        if (cleaned && !headlines.includes(cleaned)) headlines.push(cleaned);
+      }
+      if (headlines.length) return headlines.slice(0, limit);
+    } catch (err) {
+      console.error('News fetch failed:', err.message);
+    }
+  }
+  return [];
+}
+
+function buildNewsSnapshotText(headlines) {
+  const lines = ['<b>📰 News</b>'];
+  if (!headlines.length) {
+    lines.push('• News is temporarily unavailable.');
+    return lines.join('\n');
+  }
+  headlines.slice(0, 5).forEach((headline) => {
+    lines.push(`• ${escapeHtml(headline)}`);
+  });
+  return lines.join('\n');
+}
+
 async function handleGrantDigest(msg) {
   await ensureUser(msg);
-  const [{ reminders, adminItems }, phvText, items] = await Promise.all([
+  const [{ reminders, adminItems }, phvText, headlines] = await Promise.all([
     getDueItems(msg.from.id),
     buildPhvTodaySnapshotText(msg.from.id),
-    getLatestGrantUpdates(5),
+    fetchTopNewsHeadlines(5),
   ]);
   const lines = [
     '<b>Good morning ☀️</b>',
     '',
+    buildNewsSnapshotText(headlines),
+    '',
     buildDueSnapshotText(reminders, adminItems),
     '',
     phvText,
-    '',
-    '<b>🏛 Grants & Support</b>'
   ];
-  if (!items.length) lines.push('• No new grant updates found yet.');
-  items.forEach((item) => {
-    lines.push(`• <b>${escapeHtml(item.title)}</b>`);
-    if (item.client_angle) lines.push(`  ${escapeHtml(item.client_angle)}`);
-  });
   return send(msg.chat.id, lines.join('\n'), { reply_markup: MAIN_KEYBOARD });
 }
+
 
 function extractReceiptFields(text) {
   const clean = String(text || '').replace(/\r/g, '');
