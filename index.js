@@ -177,7 +177,7 @@ const MAIN_KEYBOARD = {
     ],
     [
       { text: '📰 News', callback_data: 'show:news' },
-      { text: '🏛 Grants', callback_data: 'show:grants' },
+      { text: '🔄 Refresh News', callback_data: 'show:news' },
     ],
   ],
 };
@@ -593,15 +593,6 @@ async function showHelp(chatId) {
     '<code>/addmaintenance item | interval_km | last_done_mileage</code>',
     '<code>/maintenance</code>',
     '<code>/maintdone item | mileage | optional_cost | optional_note</code>',
-    '',
-    '<b>Grants intelligence</b>',
-    '<code>/grants</code>',
-    '<code>/support</code>',
-    '<code>/linkhub</code>',
-    '<code>/latestgrants</code>',
-    '<code>/industrygrant f&b</code>',
-    '<code>/matchgrant retail wants chatbot</code>',
-    '<code>/gm</code>',
     '',
     '<b>OCR</b>',
     'Send a receipt screenshot/photo with a caption like <code>fuel</code>, <code>maintenance</code>, or <code>insurance</code>. The bot will OCR it and suggest what to save.',
@@ -1486,15 +1477,20 @@ async function fetchGoogleNews(category = 'top', limit = 10) {
   const sourceMap = {
     top: [
       'https://news.google.com/rss?hl=en-SG&gl=SG&ceid=SG:en',
-      'https://www.channelnewsasia.com/rssfeeds/8395986'
+      'https://www.channelnewsasia.com/rssfeeds/8395986',
+      'https://feeds.bbci.co.uk/news/rss.xml'
     ],
     world: [
       'https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-SG&gl=SG&ceid=SG:en',
-      'https://feeds.reuters.com/Reuters/worldNews'
+      'https://news.google.com/rss/search?q=world&hl=en-SG&gl=SG&ceid=SG:en',
+      'https://feeds.bbci.co.uk/news/world/rss.xml',
+      'https://feeds.skynews.com/feeds/rss/world.xml'
     ],
     business: [
       'https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-SG&gl=SG&ceid=SG:en',
-      'https://feeds.reuters.com/reuters/businessNews'
+      'https://news.google.com/rss/search?q=business&hl=en-SG&gl=SG&ceid=SG:en',
+      'https://feeds.bbci.co.uk/news/business/rss.xml',
+      'https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml&category=6936'
     ],
     singapore: [
       'https://news.google.com/rss/search?q=Singapore&hl=en-SG&gl=SG&ceid=SG:en',
@@ -1699,12 +1695,6 @@ async function routeMessage(msg) {
     case '/phvweek': return handlePhvWeek(msg);
     case '/phvsettings': return handlePhvSettings(msg);
     case '/shoulddrive': return handleShouldDrive(msg);
-    case '/grants': return handleGrants(msg);
-    case '/support': return handleSupport(msg);
-    case '/linkhub': return handleLinkHub(msg);
-    case '/latestgrants': return handleLatestGrants(msg);
-    case '/industrygrant': return handleIndustryGrant(msg, body);
-    case '/matchgrant': return handleMatchGrant(msg, body);
     case '/gm': return handleGrantDigest(msg);
     case '/news': return handleNews(msg, body);
     case '/decide': return handleDecide(msg, body);
@@ -1729,8 +1719,6 @@ async function routeCallback(query) {
     if (data === 'show:phvsettings') return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:shoulddrive') return handleShouldDrive(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:maintstatus') return handleMaintenance(fauxMsg, { messageId: msg.message_id });
-    if (data === 'show:grants') return handleGrants(fauxMsg, { messageId: msg.message_id });
-    if (data === 'show:grantupdates') return handleLatestGrants(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:news') return handleNews(fauxMsg, 'top', { messageId: msg.message_id });
     if (data.startsWith('show:news:')) return handleNews(fauxMsg, data.split(':')[2], { messageId: msg.message_id });
     if (data === 'show:phvstart') {
