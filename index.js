@@ -177,7 +177,7 @@ const MAIN_KEYBOARD = {
     ],
     [
       { text: '📰 News', callback_data: 'show:news' },
-      { text: '🔄 Refresh GM', callback_data: 'show:gm' },
+      { text: '🏛 Grants', callback_data: 'show:grants' },
     ],
   ],
 };
@@ -602,6 +602,7 @@ async function showHelp(chatId) {
     '<code>/industrygrant f&b</code>',
     '<code>/matchgrant retail wants chatbot</code>',
     '<code>/gm</code>',
+    '<code>/news</code>',
     '',
     '<b>OCR</b>',
     'Send a receipt screenshot/photo with a caption like <code>fuel</code>, <code>maintenance</code>, or <code>insurance</code>. The bot will OCR it and suggest what to save.',
@@ -1108,6 +1109,7 @@ function parseNaturalLanguage(text) {
   if (/^phv settings$/i.test(trimmed)) return { type: 'phvsettings' };
   if (/^(should i drive|drive today\??)$/i.test(trimmed)) return { type: 'shoulddrive' };
   if (/^(good morning|gm)$/i.test(trimmed)) return { type: 'gm' };
+  if (/^news$/i.test(trimmed)) return { type: 'news' };
   if (/^(grants|grant directory)$/i.test(trimmed)) return { type: 'grants' };
   if (/^(latest grants|grant updates)$/i.test(trimmed)) return { type: 'latestgrants' };
   if (/^(support|supportable programmes)$/i.test(trimmed)) return { type: 'support' };
@@ -1134,6 +1136,7 @@ async function handleNaturalLanguage(msg, parsed) {
     case 'phvsettings': return handlePhvSettings(msg);
     case 'shoulddrive': return handleShouldDrive(msg);
     case 'gm': return handleGrantDigest(msg);
+    case 'news': return handleNews(msg);
     case 'grants': return handleGrants(msg);
     case 'latestgrants': return handleLatestGrants(msg);
     case 'support': return handleSupport(msg);
@@ -1400,102 +1403,116 @@ async function buildPhvTodaySnapshotText(userId) {
   ].join('\n');
 }
 
-function decodeXmlText(value = '') {
-  return String(value)
+function decodeXmlEntities(text = '') {
+  return String(text || '')
     .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
     .trim();
 }
 
-function parseRssItems(xml, limit = 10) {
+function stripHtmlTags(text = '') {
+  return decodeXmlEntities(String(text || '').replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
+}
+
+function buildTldr(text = '', maxLen = 220) {
+  const cleaned = stripHtmlTags(text);
+  if (!cleaned) return 'TLDR: Tap the headline to read more.';
+  if (cleaned.length <= maxLen) return `TLDR: ${cleaned}`;
+  const cut = cleaned.slice(0, maxLen);
+  const lastSpace = cut.lastIndexOf(' ');
+  const shortText = lastSpace > 80 ? cut.slice(0, lastSpace) : cut;
+  return `TLDR: ${shortText.trim()}…`;
+}
+
+function extractTagContent(block, tagName) {
+  const cdataRe = new RegExp(`<${tagName}[^>]*><!\[CDATA\[([\s\S]*?)\]\]><\/${tagName}>`, 'i');
+  const plainRe = new RegExp(`<${tagName}[^>]*>([\s\S]*?)<\/${tagName}>`, 'i');
+  const cdata = block.match(cdataRe);
+  if (cdata) return decodeXmlEntities(cdata[1]);
+  const plain = block.match(plainRe);
+  return plain ? decodeXmlEntities(plain[1]) : '';
+}
+
+function parseRssItems(xml = '', limit = 8) {
   const items = [];
-  const blocks = String(xml || '').match(/<item>[\s\S]*?<\/item>/gi) || [];
-  for (const block of blocks) {
+  const seen = new Set();
+  const itemBlocks = String(xml || '').match(/<item>[\s\S]*?<\/item>/gi) || [];
+  for (const block of itemBlocks) {
     if (items.length >= limit) break;
-    const titleMatch = block.match(/<title>([\s\S]*?)<\/title>/i);
-    const linkMatch = block.match(/<link>([\s\S]*?)<\/link>/i);
-    const title = decodeXmlText(titleMatch ? titleMatch[1] : '').replace(/\s+-\s+[^-]+$/, '').trim();
-    const link = decodeXmlText(linkMatch ? linkMatch[1] : '');
+    const title = extractTagContent(block, 'title').replace(/\s+-\s+[^-]+$/, '').trim();
+    const link = extractTagContent(block, 'link').trim();
+    const description = extractTagContent(block, 'description').trim() || extractTagContent(block, 'content:encoded').trim();
     if (!title || !link) continue;
-    if (items.some((x) => x.link === link || x.title === title)) continue;
-    items.push({ title, link });
+    const key = `${title}||${link}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push({ title, link, summary: description });
   }
   return items;
 }
 
-function getNewsFeedUrl(section = 'top') {
-  const encoded = (q) => `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-SG&gl=SG&ceid=SG:en`;
-  if (section === 'singapore') return encoded('Singapore');
-  if (section === 'business') return encoded('Singapore business OR business');
-  if (section === 'world') return encoded('world');
-  return 'https://news.google.com/rss?hl=en-SG&gl=SG&ceid=SG:en';
-}
-
-async function fetchTopNewsHeadlines(limit = 8, section = 'top') {
+async function fetchTopNewsItems(limit = 8) {
   const sources = [
-    getNewsFeedUrl(section),
+    'https://news.google.com/rss?hl=en-SG&gl=SG&ceid=SG:en',
     'https://www.channelnewsasia.com/rssfeeds/8395986'
   ];
   for (const url of sources) {
     try {
-      const response = await axios.get(url, {
-        timeout: 15000,
-        responseType: 'text',
-        maxRedirects: 5,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 TelegramBot/1.0',
-          'Accept': 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8'
-        }
-      });
-      const items = parseRssItems(response.data, limit);
+      const response = await axios.get(url, { timeout: 10000, responseType: 'text' });
+      const xml = String(response.data || '');
+      const items = parseRssItems(xml, limit);
       if (items.length) return items.slice(0, limit);
     } catch (err) {
-      console.error(`News fetch failed for ${url}:`, err.message);
+      console.error('News fetch failed:', err.message);
     }
   }
   return [];
 }
 
-function buildNewsSnapshotText(items, sectionLabel = 'Top') {
-  const lines = [`<b>📰 ${escapeHtml(sectionLabel)} news</b>`];
+function buildNewsSnapshotText(items) {
+  const lines = ['<b>📰 News</b>', ''];
   if (!items.length) {
-    lines.push('• Live news is temporarily unavailable.');
+    lines.push('No live news items are available right now.');
     return lines.join('\n');
   }
-  items.forEach((item) => {
-    lines.push(`• <a href="${escapeHtml(item.link)}">${escapeHtml(item.title)}</a>`);
+  items.forEach((item, index) => {
+    const title = item?.title || 'Untitled';
+    const link = item?.link || '';
+    const tldr = buildTldr(item?.summary || '');
+    if (link) {
+      lines.push(`${index + 1}. <a href="${escapeHtml(link)}">${escapeHtml(title)}</a>`);
+    } else {
+      lines.push(`${index + 1}. <b>${escapeHtml(title)}</b>`);
+    }
+    lines.push(escapeHtml(tldr));
+    lines.push('');
   });
   return lines.join('\n');
 }
 
-async function handleNews(msg, section = 'top') {
+async function handleNews(msg, editContext = null) {
   await ensureUser(msg);
-  const sectionLabel = section === 'singapore' ? 'Singapore' : section === 'business' ? 'Business' : section === 'world' ? 'World' : 'Top';
-  const items = await fetchTopNewsHeadlines(12, section);
-  return send(msg.chat.id, buildNewsSnapshotText(items, sectionLabel), { reply_markup: MAIN_KEYBOARD });
+  const items = await fetchTopNewsItems(10);
+  const text = buildNewsSnapshotText(items);
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
 }
 
 async function handleGrantDigest(msg) {
   await ensureUser(msg);
-  const [{ reminders, adminItems }, phvText, topItems, singaporeItems, businessItems] = await Promise.all([
+  const [{ reminders, adminItems }, phvText, items] = await Promise.all([
     getDueItems(msg.from.id),
     buildPhvTodaySnapshotText(msg.from.id),
-    fetchTopNewsHeadlines(6, 'top'),
-    fetchTopNewsHeadlines(4, 'singapore'),
-    fetchTopNewsHeadlines(4, 'business'),
+    fetchTopNewsItems(8),
   ]);
   const lines = [
     '<b>Good morning ☀️</b>',
     '',
-    buildNewsSnapshotText(topItems, 'Top'),
-    '',
-    buildNewsSnapshotText(singaporeItems, 'Singapore'),
-    '',
-    buildNewsSnapshotText(businessItems, 'Business'),
+    buildNewsSnapshotText(items),
     '',
     buildDueSnapshotText(reminders, adminItems),
     '',
@@ -1634,7 +1651,7 @@ async function routeMessage(msg) {
     case '/industrygrant': return handleIndustryGrant(msg, body);
     case '/matchgrant': return handleMatchGrant(msg, body);
     case '/gm': return handleGrantDigest(msg);
-    case '/news': return handleNews(msg, body.toLowerCase() || 'top');
+    case '/news': return handleNews(msg);
     case '/decide': return handleDecide(msg, body);
     case '/addmaintenance': return handleAddMaintenance(msg, body);
     case '/maintenance':
@@ -1657,10 +1674,9 @@ async function routeCallback(query) {
     if (data === 'show:phvsettings') return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:shoulddrive') return handleShouldDrive(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:maintstatus') return handleMaintenance(fauxMsg, { messageId: msg.message_id });
-    if (data === 'show:news') return handleNews(fauxMsg, 'top');
-    if (data === 'show:gm') return handleGrantDigest(fauxMsg);
     if (data === 'show:grants') return handleGrants(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:grantupdates') return handleLatestGrants(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:news') return handleNews(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:phvstart') {
       pendingInputs.set(query.from.id, { kind: 'phvstart' });
       return send(msg.chat.id, 'Send your starting mileage. Example: <code>112280</code>');
