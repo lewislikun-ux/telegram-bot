@@ -167,6 +167,10 @@ const MAIN_KEYBOARD = {
       { text: '⛽ PHV Settings', callback_data: 'show:phvsettings' },
       { text: '🛠 Maintenance', callback_data: 'show:maintstatus' },
     ],
+    [
+      { text: '🏛 Grants', callback_data: 'show:grants' },
+      { text: '🆕 Grant Updates', callback_data: 'show:latestgrants' },
+    ],
   ],
 };
 
@@ -529,6 +533,183 @@ function phvSettingsText(settings) {
   ].join('\n');
 }
 
+
+async function getGrantSupports(limit = 24) {
+  const { data, error } = await supabase
+    .from('grants_master')
+    .select('*')
+    .eq('status', 'active')
+    .order('category', { ascending: true })
+    .order('name', { ascending: true })
+    .limit(limit);
+  if (error) throw error;
+  return data || [];
+}
+async function getGrantUpdates(limit = 8) {
+  const { data, error } = await supabase
+    .from('grant_updates')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+  return data || [];
+}
+function groupGrantSupports(items) {
+  const grouped = {};
+  (items || []).forEach((item) => {
+    const key = item.category || 'Other';
+    if (!grouped[key]) grouped[key] = [];
+    grouped[key].push(item);
+  });
+  return grouped;
+}
+function formatGrantSupportList(items, { title = '<b>Grants & Support</b>', compact = false } = {}) {
+  if (!items.length) return '<b>Grants & Support</b>\n\nNo active grant or programme records found yet.';
+  const grouped = groupGrantSupports(items);
+  const lines = [title, ''];
+  Object.keys(grouped).sort().forEach((category) => {
+    lines.push(`<b>${escapeHtml(category)}</b>`);
+    grouped[category].forEach((item) => {
+      lines.push(`• <b>${escapeHtml(item.name || 'Untitled')}</b>`);
+      if (item.description) lines.push(`  ${escapeHtml(item.description)}`);
+      if (!compact && item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
+    });
+    lines.push('');
+  });
+  return lines.join('\n').trim();
+}
+function formatGrantLinkHub(items) {
+  if (!items.length) return '<b>Grant Link Hub</b>\n\nNo active records found yet.';
+  const lines = ['<b>Grant Link Hub</b>', ''];
+  items.forEach((item) => {
+    lines.push(`• <b>${escapeHtml(item.name || 'Untitled')}</b>`);
+    if (item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
+  });
+  return lines.join('\n');
+}
+function formatGrantUpdates(updates) {
+  if (!updates.length) return '<b>Latest grant updates</b>\n\nNo update records found yet.';
+  const lines = ['<b>Latest grant updates</b>', ''];
+  updates.forEach((item) => {
+    lines.push(`• <b>${escapeHtml(item.title || 'Untitled update')}</b>`);
+    if (item.summary) lines.push(`  ${escapeHtml(item.summary)}`);
+    if (item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
+  });
+  return lines.join('\n');
+}
+function normalizeGrantKeyword(value) {
+  return String(value || '').trim().toLowerCase();
+}
+function scoreGrantMatch(item, queryText) {
+  const q = normalizeGrantKeyword(queryText);
+  if (!q) return 0;
+  let score = 0;
+  const keywords = Array.isArray(item.keywords) ? item.keywords : [];
+  keywords.forEach((kw) => {
+    const k = normalizeGrantKeyword(kw);
+    if (!k) return;
+    if (q.includes(k)) score += Math.max(3, k.split(' ').length);
+  });
+  const haystacks = [item.name, item.category, item.description].map((x) => normalizeGrantKeyword(x));
+  haystacks.forEach((field) => {
+    if (field && q.includes(field)) score += 2;
+    else if (field && field.split(' ').some((token) => token && q.includes(token))) score += 1;
+  });
+  return score;
+}
+async function handleGrants(msg, editContext = null) {
+  await ensureUser(msg);
+  try {
+    const items = await getGrantSupports();
+    const text = formatGrantSupportList(items);
+    const extra = { reply_markup: { inline_keyboard: [[{ text: '🆕 Grant Updates', callback_data: 'show:latestgrants' }, { text: '🔗 Link Hub', callback_data: 'show:linkhub' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
+    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, extra) : send(msg.chat.id, text, extra);
+  } catch (err) {
+    console.error(err);
+    return send(msg.chat.id, 'Could not load grants and support items.');
+  }
+}
+async function handleGrantUpdates(msg, editContext = null) {
+  await ensureUser(msg);
+  try {
+    const updates = await getGrantUpdates();
+    const text = formatGrantUpdates(updates);
+    const extra = { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🔗 Link Hub', callback_data: 'show:linkhub' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
+    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, extra) : send(msg.chat.id, text, extra);
+  } catch (err) {
+    console.error(err);
+    return send(msg.chat.id, 'Could not load grant updates.');
+  }
+}
+async function handleGrantLinkHub(msg, editContext = null) {
+  await ensureUser(msg);
+  try {
+    const items = await getGrantSupports();
+    const text = formatGrantLinkHub(items);
+    const extra = { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🆕 Grant Updates', callback_data: 'show:latestgrants' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
+    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, extra) : send(msg.chat.id, text, extra);
+  } catch (err) {
+    console.error(err);
+    return send(msg.chat.id, 'Could not load the grant link hub.');
+  }
+}
+async function handleMatchGrant(msg, body) {
+  await ensureUser(msg);
+  const query = String(body || '').trim();
+  if (!query) return send(msg.chat.id, 'Use: <code>/matchgrant your client need</code>');
+  try {
+    const items = await getGrantSupports(100);
+    const ranked = items
+      .map((item) => ({ item, score: scoreGrantMatch(item, query) }))
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 6);
+    if (!ranked.length) {
+      return send(msg.chat.id, [
+        '<b>Recommended support</b>',
+        '',
+        `Need: <blockquote>${escapeHtml(query)}</blockquote>`,
+        'No direct match found yet in your grant dataset.',
+        'Try adding more records into <code>grants_master</code> or use more specific keywords like <code>aircon</code>, <code>chiller</code>, <code>chatbot</code>, <code>overseas</code>, <code>POS</code>.',
+      ].join('\n'));
+    }
+    const lines = [
+      '<b>Recommended support</b>',
+      '',
+      `Need: <blockquote>${escapeHtml(query)}</blockquote>`,
+      '',
+    ];
+    ranked.forEach(({ item }) => {
+      lines.push(`• <b>${escapeHtml(item.name || 'Untitled')}</b>`);
+      if (item.description) lines.push(`  ${escapeHtml(item.description)}`);
+      if (item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
+      lines.push('');
+    });
+    return send(msg.chat.id, lines.join('\n').trim(), { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🆕 Grant Updates', callback_data: 'show:latestgrants' }]] } });
+  } catch (err) {
+    console.error(err);
+    return send(msg.chat.id, 'Could not run grant matching.');
+  }
+}
+async function handleGrantMorning(msg) {
+  await ensureUser(msg);
+  try {
+    const updates = await getGrantUpdates(5);
+    const text = [
+      'Good morning ☀️',
+      '',
+      '<b>Grants & support updates</b>',
+      ...(updates.length
+        ? updates.map((item) => `• ${escapeHtml(item.title || 'Untitled update')}`)
+        : ['• No new grant updates found yet.']),
+    ].join('\n');
+    return send(msg.chat.id, text, { reply_markup: { inline_keyboard: [[{ text: '🆕 Full Updates', callback_data: 'show:latestgrants' }, { text: '🏛 Grants', callback_data: 'show:grants' }]] } });
+  } catch (err) {
+    console.error(err);
+    return send(msg.chat.id, 'Could not build the grant morning digest.');
+  }
+}
+
 async function handleStart(msg) {
   await ensureUser(msg);
   return send(msg.chat.id, [
@@ -541,6 +722,7 @@ async function handleStart(msg) {
     '• PHV start / now / end mileage flow',
     '• mileage-based maintenance tracker',
     '• screenshot / receipt OCR reader (best effort)',
+    '• grants / grant updates / grant matching',
     '',
     'Try:',
     '<code>/phvstart 112280</code>',
@@ -548,6 +730,9 @@ async function handleStart(msg) {
     '<code>/phvend 112348 | gross:145</code>',
     '<code>/addmaintenance engine servicing | 8000 | 112000</code>',
     '<code>/phvsettings</code>',
+    '<code>/grants</code>',
+    '<code>/latestgrants</code>',
+    '<code>/matchgrant retail wants chatbot</code>',
   ].join('\n'), { reply_markup: MAIN_KEYBOARD });
 }
 async function showHelp(chatId) {
@@ -581,6 +766,12 @@ async function showHelp(chatId) {
     '<code>/addmaintenance item | interval_km | last_done_mileage</code>',
     '<code>/maintenance</code>',
     '<code>/maintdone item | mileage | optional_cost | optional_note</code>',
+    '',
+    '<b>Grants</b>',
+    '<code>/grants</code>',
+    '<code>/latestgrants</code>',
+    '<code>/linkhub</code>',
+    '<code>/matchgrant retail wants chatbot</code>',
     '',
     '<b>OCR</b>',
     'Send a receipt screenshot/photo with a caption like <code>fuel</code>, <code>maintenance</code>, or <code>insurance</code>. The bot will OCR it and suggest what to save.',
@@ -1086,6 +1277,10 @@ function parseNaturalLanguage(text) {
   if (/^maintenance$/i.test(trimmed)) return { type: 'maintenance' };
   if (/^phv settings$/i.test(trimmed)) return { type: 'phvsettings' };
   if (/^(should i drive|drive today\??)$/i.test(trimmed)) return { type: 'shoulddrive' };
+  if (/^(good morning|gm)$/i.test(trimmed)) return { type: 'grantmorning' };
+  if (/^(grants|grant list)$/i.test(trimmed)) return { type: 'grants' };
+  if (/^(latest grants|grant updates)$/i.test(trimmed)) return { type: 'latestgrants' };
+  if (/^(grant hub|link hub)$/i.test(trimmed)) return { type: 'linkhub' };
   return null;
 }
 async function handleNaturalLanguage(msg, parsed) {
@@ -1107,6 +1302,10 @@ async function handleNaturalLanguage(msg, parsed) {
     case 'phvweek': return handlePhvWeek(msg);
     case 'phvsettings': return handlePhvSettings(msg);
     case 'shoulddrive': return handleShouldDrive(msg);
+    case 'grants': return handleGrants(msg);
+    case 'latestgrants': return handleGrantUpdates(msg);
+    case 'linkhub': return handleGrantLinkHub(msg);
+    case 'grantmorning': return handleGrantMorning(msg);
     case 'maintenance': return handleMaintenance(msg);
     case 'addmaintenance': return handleAddMaintenance(msg, parsed.body);
     case 'maintdone': return handleMaintDone(msg, parsed.body);
@@ -1236,6 +1435,12 @@ async function routeMessage(msg) {
     case '/phvweek': return handlePhvWeek(msg);
     case '/phvsettings': return handlePhvSettings(msg);
     case '/shoulddrive': return handleShouldDrive(msg);
+    case '/grants':
+    case '/support': return handleGrants(msg);
+    case '/latestgrants': return handleGrantUpdates(msg);
+    case '/linkhub': return handleGrantLinkHub(msg);
+    case '/matchgrant': return handleMatchGrant(msg, body);
+    case '/gm': return handleGrantMorning(msg);
     case '/decide': return handleDecide(msg, body);
     case '/addmaintenance': return handleAddMaintenance(msg, body);
     case '/maintenance':
@@ -1258,6 +1463,9 @@ async function routeCallback(query) {
     if (data === 'show:phvsettings') return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:shoulddrive') return handleShouldDrive(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:maintstatus') return handleMaintenance(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:grants') return handleGrants(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:latestgrants') return handleGrantUpdates(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:linkhub') return handleGrantLinkHub(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:phvstart') {
       pendingInputs.set(query.from.id, { kind: 'phvstart' });
       return send(msg.chat.id, 'Send your starting mileage. Example: <code>112280</code>');
