@@ -648,13 +648,10 @@ function formatGrantSupportLine(item, { includeWebpage = true, includeMeta = tru
   if (item.description) lines.push(`  ${escapeHtml(item.description)}`);
   if (item.eligibility_summary) lines.push(`  Who should use this: ${escapeHtml(item.eligibility_summary)}`);
   if (includeWebpage && item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
-  return lines.join('
-');
+  return lines.join('\n');
 }
 function formatGrantSupportList(items, { title = '<b>Grants & Support</b>', compact = false } = {}) {
-  if (!items.length) return `${title}
-
-No active grant or programme records found yet.`;
+  if (!items.length) return `${title}\n\nNo active grant or programme records found yet.`;
   const grouped = groupGrantSupports(items);
   const lines = [title, ''];
   Object.keys(grouped).sort().forEach((category) => {
@@ -662,13 +659,10 @@ No active grant or programme records found yet.`;
     grouped[category].forEach((item) => lines.push(formatGrantSupportLine(item, { includeWebpage: !compact, includeMeta: true })));
     lines.push('');
   });
-  return lines.join('
-').trim();
+  return lines.join('\n').trim();
 }
 function formatGrantLinkHub(items) {
-  if (!items.length) return '<b>Grant Link Hub</b>
-
-No active records found yet.';
+  if (!items.length) return '<b>Grant Link Hub</b>\n\nNo active records found yet.';
   const grouped = groupGrantSupports(items);
   const lines = ['<b>Grant Link Hub</b>', '', 'One-stop list of grants, programmes, FIRCs and IHL support links.', ''];
   Object.keys(grouped).sort().forEach((category) => {
@@ -679,13 +673,10 @@ No active records found yet.';
     });
     lines.push('');
   });
-  return lines.join('
-').trim();
+  return lines.join('\n').trim();
 }
 function formatGrantUpdates(updates) {
-  if (!updates.length) return '<b>Latest grant updates</b>
-
-No update records found yet.';
+  if (!updates.length) return '<b>Latest grant updates</b>\n\nNo update records found yet.';
   const lines = ['<b>Latest grant updates</b>', ''];
   updates.forEach((item) => {
     lines.push(`• <b>${escapeHtml(item.title || 'Untitled update')}</b>`);
@@ -693,8 +684,7 @@ No update records found yet.';
     if (item.client_angle) lines.push(`  Useful for clients: ${escapeHtml(item.client_angle)}`);
     if (item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
   });
-  return lines.join('
-');
+  return lines.join('\n');
 }
 function buildSupportStackFromMatches(matches) {
   const buckets = {
@@ -774,9 +764,9 @@ async function handleIndustryGrantHelp(msg, editContext = null) {
     '• <code>/industrygrant manufacturing</code>',
     '• <code>/industrygrant services</code>',
     '• <code>/industrygrant startup</code>',
-  ].join('
-');
-  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🔗 Link Hub', callback_data: 'show:linkhub' }]] } }) : send(msg.chat.id, text, { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🔗 Link Hub', callback_data: 'show:linkhub' }]] } });
+  ].join('\n');
+  const extra = { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🔗 Link Hub', callback_data: 'show:linkhub' }]] } };
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, extra) : send(msg.chat.id, text, extra);
 }
 async function handleMatchGrant(msg, body) {
   await ensureUser(msg);
@@ -799,8 +789,7 @@ async function handleMatchGrant(msg, body) {
         `Need: <blockquote>${escapeHtml(query)}</blockquote>`,
         'No direct match found yet in your grant dataset.',
         'Try adding more records into <code>grants_master</code> or use more specific keywords like <code>aircon</code>, <code>chiller</code>, <code>chatbot</code>, <code>overseas</code>, <code>POS</code>.',
-      ].join('
-'));
+      ].join('\n'));
     }
     const stack = buildSupportStackFromMatches(ranked);
     const lines = [
@@ -828,8 +817,7 @@ async function handleMatchGrant(msg, body) {
     }
     lines.push('<b>Why this stack works</b>');
     lines.push('• Combines funding with execution support and capability-building where possible.');
-    return send(msg.chat.id, lines.join('
-').trim(), { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🏭 By Industry', callback_data: 'show:industryhelp' }], [{ text: '🆕 Grant Updates', callback_data: 'show:latestgrants' }]] } });
+    return send(msg.chat.id, lines.join('\n').trim(), { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🏭 By Industry', callback_data: 'show:industryhelp' }], [{ text: '🆕 Grant Updates', callback_data: 'show:latestgrants' }]] } });
   } catch (err) {
     console.error(err);
     return send(msg.chat.id, 'Could not run grant matching.');
@@ -845,434 +833,17 @@ async function handleGrantMorning(msg) {
       'Good morning ☀️',
       '',
       '<b>Grants & support updates</b>',
-      ...(updates.length
-        ? updates.map((item) => `• ${escapeHtml(item.title || 'Untitled update')}`)
-        : ['• No new grant updates found yet.']),
+      ...(updates.length ? updates.map((item) => `• ${escapeHtml(item.title || 'Untitled update')}`) : ['• No new grant updates found yet.']),
       '',
       '<b>Useful for clients today</b>',
-      ...(highPriority.length
-        ? highPriority.map((item) => `• ${escapeHtml(item.name)} — ${escapeHtml(item.description || '')}`)
-        : ['• Add high-priority records into <code>grants_master</code> to surface advisor picks here.']),
-    ].join('
-');
+      ...(highPriority.length ? highPriority.map((item) => `• ${escapeHtml(item.name)} — ${escapeHtml(item.description || '')}`) : ['• Add high-priority records into <code>grants_master</code> to surface advisor picks here.']),
+    ].join('\n');
     return send(msg.chat.id, text, { reply_markup: { inline_keyboard: [[{ text: '🆕 Full Updates', callback_data: 'show:latestgrants' }, { text: '🏛 Grants', callback_data: 'show:grants' }], [{ text: '🏭 By Industry', callback_data: 'show:industryhelp' }]] } });
   } catch (err) {
     console.error(err);
-    return send(msg.chat.id, 'Could not build the grant morning digest.');
+    return send(msg.chat.id, 'Could not build the grant morning update.');
   }
 }
-
-
-async function handleStart(msg) {
-  await ensureUser(msg);
-  return send(msg.chat.id, [
-    `<b>Hi ${escapeHtml(msg.from.first_name || 'there')}</b>`,
-    '',
-    'This Phase 3 build includes:',
-    '• notes / tasks / reminders',
-    '• admin due tracking',
-    '• PHV settings + PHV logging',
-    '• PHV start / now / end mileage flow',
-    '• mileage-based maintenance tracker',
-    '• screenshot / receipt OCR reader (best effort)',
-    '• grants / grant updates / grant matching / industry lookup',
-    '',
-    'Try:',
-    '<code>/phvstart 112280</code>',
-    '<code>/phvnow gross:62 | current:112314</code>',
-    '<code>/phvend 112348 | gross:145</code>',
-    '<code>/addmaintenance engine servicing | 8000 | 112000</code>',
-    '<code>/phvsettings</code>',
-    '<code>/grants</code>',
-    '<code>/latestgrants</code>',
-    '<code>/matchgrant retail wants chatbot</code>',
-  ].join('\n'), { reply_markup: MAIN_KEYBOARD });
-}
-async function showHelp(chatId) {
-  return send(chatId, [
-    '<b>Commands</b>',
-    '',
-    '<b>Capture</b>',
-    '<code>/note text</code>',
-    '<code>/idea text</code>',
-    '<code>/task text</code>',
-    '<code>/done keyword</code>',
-    '<code>/search keyword</code>',
-    '',
-    '<b>Reminders / admin</b>',
-    '<code>/remind YYYY-MM-DD HH:MM | message</code>',
-    '<code>/adminadd title | YYYY-MM-DD | none|monthly|yearly | 30,7,1</code>',
-    '<code>/admindone keyword</code>',
-    '<code>/due</code>',
-    '',
-    '<b>PHV</b>',
-    '<code>/phvlog date:2026-03-27 | gross:145 | hours:2.5 | km:68</code>',
-    '<code>/phvstart 112280</code>',
-    '<code>/phvnow gross:62 | current:112314</code>',
-    '<code>/phvend 112348 | gross:145</code>',
-    '<code>/phvtoday</code>',
-    '<code>/phvweek</code>',
-    '<code>/shoulddrive</code>',
-    '<code>/phvsettings</code>',
-    '',
-    '<b>Maintenance</b>',
-    '<code>/addmaintenance item | interval_km | last_done_mileage</code>',
-    '<code>/maintenance</code>',
-    '<code>/maintdone item | mileage | optional_cost | optional_note</code>',
-    '',
-    '<b>Grants</b>',
-    '<code>/grants</code>',
-    '<code>/latestgrants</code>',
-    '<code>/linkhub</code>',
-    '<code>/matchgrant retail wants chatbot</code>',
-    '',
-    '<b>OCR</b>',
-    'Send a receipt screenshot/photo with a caption like <code>fuel</code>, <code>maintenance</code>, or <code>insurance</code>. The bot will OCR it and suggest what to save.',
-  ].join('\n'), { reply_markup: MAIN_KEYBOARD });
-}
-
-async function handleNote(msg, body, noteType = 'note') {
-  if (!body) return send(msg.chat.id, `Use: <code>/${noteType} your text</code>`);
-  await ensureUser(msg);
-  const { error } = await supabase.from('notes').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, note_type: noteType, content: body, created_at: nowIso() });
-  if (error) { console.error(error); return send(msg.chat.id, 'Could not save note.'); }
-  return send(msg.chat.id, `Saved ${escapeHtml(noteType)}:\n<blockquote>${escapeHtml(body)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
-}
-async function handleTask(msg, body) {
-  if (!body) return send(msg.chat.id, 'Use: <code>/task your task</code>');
-  await ensureUser(msg);
-  const { error } = await supabase.from('tasks').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, content: body, status: 'open', created_at: nowIso(), updated_at: nowIso() });
-  if (error) { console.error(error); return send(msg.chat.id, 'Could not save task.'); }
-  return send(msg.chat.id, `Saved task:\n<blockquote>${escapeHtml(body)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
-}
-async function handleDone(msg, keyword) {
-  if (!keyword) return send(msg.chat.id, 'Use: <code>/done keyword</code>');
-  await ensureUser(msg);
-  const { data, error } = await supabase.from('tasks').select('*').eq('telegram_user_id', msg.from.id).eq('status', 'open').ilike('content', `%${keyword}%`).order('created_at', { ascending: false }).limit(1);
-  if (error) { console.error(error); return send(msg.chat.id, 'Could not search tasks.'); }
-  const task = data?.[0];
-  if (!task) return send(msg.chat.id, 'No open task matched that keyword.');
-  const { error: upd } = await supabase.from('tasks').update({ status: 'done', updated_at: nowIso(), completed_at: nowIso() }).eq('id', task.id);
-  if (upd) { console.error(upd); return send(msg.chat.id, 'Could not mark task done.'); }
-  return send(msg.chat.id, `Marked done:\n<blockquote>${escapeHtml(task.content)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
-}
-async function handleSearch(msg, keyword) {
-  if (!keyword) return send(msg.chat.id, 'Use: <code>/search keyword</code>');
-  await ensureUser(msg);
-  const [notesRes, tasksRes, adminRes, phvRes, maintRes] = await Promise.all([
-    supabase.from('notes').select('*').eq('telegram_user_id', msg.from.id).ilike('content', `%${keyword}%`).limit(5),
-    supabase.from('tasks').select('*').eq('telegram_user_id', msg.from.id).ilike('content', `%${keyword}%`).limit(5),
-    supabase.from('admin_items').select('*').eq('telegram_user_id', msg.from.id).ilike('title', `%${keyword}%`).limit(5),
-    supabase.from('phv_logs').select('*').eq('telegram_user_id', msg.from.id).ilike('notes', `%${keyword}%`).limit(5),
-    supabase.from('maintenance_items').select('*').eq('telegram_user_id', msg.from.id).ilike('item_name', `%${keyword}%`).limit(5),
-  ]);
-  const errors = [notesRes.error, tasksRes.error, adminRes.error, phvRes.error, maintRes.error].filter(Boolean);
-  if (errors.length) { console.error(errors); return send(msg.chat.id, 'Search failed.'); }
-  const lines = [`<b>Search results for:</b> ${escapeHtml(keyword)}`, ''];
-  if (notesRes.data?.length) { lines.push('<b>Notes</b>'); notesRes.data.forEach((x) => lines.push(`• [${escapeHtml(x.note_type)}] ${escapeHtml(x.content)}`)); lines.push(''); }
-  if (tasksRes.data?.length) { lines.push('<b>Tasks</b>'); tasksRes.data.forEach((x) => lines.push(`• [${escapeHtml(x.status)}] ${escapeHtml(x.content)}`)); lines.push(''); }
-  if (adminRes.data?.length) { lines.push('<b>Admin items</b>'); adminRes.data.forEach((x) => lines.push(`• ${escapeHtml(x.title)} — ${escapeHtml(x.next_due_date)}`)); lines.push(''); }
-  if (maintRes.data?.length) { lines.push('<b>Maintenance</b>'); maintRes.data.forEach((x) => lines.push(`• ${escapeHtml(x.item_name)} — next due ${escapeHtml(String(x.next_due_mileage))}`)); lines.push(''); }
-  if (phvRes.data?.length) { lines.push('<b>PHV logs</b>'); phvRes.data.forEach((x) => lines.push(`• ${escapeHtml(x.log_date)} — gross ${escapeHtml(currency(x.gross_amount))}`)); }
-  if (lines.length <= 2) return send(msg.chat.id, 'No matches found.');
-  return send(msg.chat.id, lines.join('\n'), { reply_markup: MAIN_KEYBOARD });
-}
-
-async function handleRemind(msg, body) {
-  if (!body || !body.includes('|')) return send(msg.chat.id, 'Use: <code>/remind YYYY-MM-DD HH:MM | message</code>');
-  await ensureUser(msg);
-  const [left, ...rest] = body.split('|');
-  const dt = parseDateTimeInput(left.trim());
-  const content = rest.join('|').trim();
-  if (!dt || !content) return send(msg.chat.id, 'Could not read that reminder.');
-  const { error } = await supabase.from('reminders').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, content, remind_at: dt.iso, status: 'open', created_at: nowIso() });
-  if (error) { console.error(error); return send(msg.chat.id, 'Could not save reminder.'); }
-  return send(msg.chat.id, `Saved reminder for <b>${escapeHtml(dt.date)} ${escapeHtml(dt.time)}</b>:\n<blockquote>${escapeHtml(content)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
-}
-async function handleAdminAdd(msg, body) {
-  const parsed = parseAdminAdd(body);
-  if (!parsed) return send(msg.chat.id, 'Use: <code>/adminadd title | YYYY-MM-DD | none|monthly|yearly | 30,7,1</code>');
-  await ensureUser(msg);
-  const nextDue = computeNextDueDate(parsed.dueDate, parsed.recurrence);
-  const { error } = await supabase.from('admin_items').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, title: parsed.title, base_due_date: parsed.dueDate, next_due_date: nextDue, recurrence: parsed.recurrence, lead_days: parsed.leadDays, is_active: true, created_at: nowIso(), updated_at: nowIso() });
-  if (error) { console.error(error); return send(msg.chat.id, 'Could not save admin item.'); }
-  return send(msg.chat.id, `Saved admin item:\n<b>${escapeHtml(parsed.title)}</b>\nDue: <b>${escapeHtml(nextDue)}</b>\nRecurrence: <b>${escapeHtml(parsed.recurrence)}</b>`, { reply_markup: MAIN_KEYBOARD });
-}
-async function findAdminItem(userId, keyword) {
-  const { data, error } = await supabase.from('admin_items').select('*').eq('telegram_user_id', userId).eq('is_active', true).ilike('title', `%${keyword}%`).order('next_due_date', { ascending: true }).limit(1);
-  if (error) throw error;
-  return data?.[0] || null;
-}
-async function completeAdminItem(chatId, row) {
-  if (!row) return send(chatId, 'Admin item not found.');
-  if (row.recurrence === 'none') {
-    const { error } = await supabase.from('admin_items').update({ is_active: false, updated_at: nowIso() }).eq('id', row.id);
-    if (error) throw error;
-    return send(chatId, `✅ Marked done: <b>${escapeHtml(row.title)}</b>\nNo further reminders for this item.`, { reply_markup: MAIN_KEYBOARD });
-  }
-  const nextDue = computeFollowingDueDate(row.next_due_date, row.recurrence);
-  const { error } = await supabase.from('admin_items').update({ base_due_date: nextDue, next_due_date: nextDue, updated_at: nowIso() }).eq('id', row.id);
-  if (error) throw error;
-  return send(chatId, `✅ Marked done: <b>${escapeHtml(row.title)}</b>\nNext due: <b>${escapeHtml(nextDue)}</b>`, { reply_markup: MAIN_KEYBOARD });
-}
-async function handleAdminDone(msg, keyword) {
-  if (!keyword) return send(msg.chat.id, 'Use: <code>/admindone keyword</code>');
-  await ensureUser(msg);
-  try {
-    const row = await findAdminItem(msg.from.id, keyword);
-    if (!row) return send(msg.chat.id, 'No active admin item matched that keyword.');
-    return completeAdminItem(msg.chat.id, row);
-  } catch (err) {
-    console.error(err);
-    return send(msg.chat.id, 'Could not mark admin item done.');
-  }
-}
-async function handleDue(msg, editContext = null) {
-  await ensureUser(msg);
-  try {
-    const { reminders, adminItems } = await getDueItems(msg.from.id);
-    const text = buildDueText(reminders, adminItems);
-    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: dueButtons(adminItems) }) : send(msg.chat.id, text, { reply_markup: dueButtons(adminItems) });
-  } catch (err) {
-    console.error(err);
-    return send(msg.chat.id, 'Could not load due items.');
-  }
-}
-
-async function handlePhvSettings(msg, editContext = null) {
-  await ensureUser(msg);
-  try {
-    const settings = await getOrCreatePhvSettings(msg);
-    const text = phvSettingsText(settings);
-    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: phvSettingsButtons(settings) }) : send(msg.chat.id, text, { reply_markup: phvSettingsButtons(settings) });
-  } catch (err) {
-    console.error(err);
-    return send(msg.chat.id, 'Could not load PHV settings.');
-  }
-}
-async function handlePhvLog(msg, body) {
-  const parsed = parsePhvBody(body);
-  if (!parsed) return send(msg.chat.id, 'Use: <code>/phvlog date:2026-03-27 | gross:145 | hours:2.5 | km:68 | petrol:18</code>');
-  await ensureUser(msg);
-  let settings = null;
-  let autoPetrolUsed = false;
-  try { settings = await getOrCreatePhvSettings(msg); } catch (e) { console.error(e); }
-  if ((parsed.petrol_cost === null || parsed.petrol_cost === undefined) && parsed.km_driven !== null && settings) {
-    const autoPetrol = calculatePhvPetrolCost(parsed.km_driven, settings);
-    if (autoPetrol !== null) { parsed.petrol_cost = autoPetrol; autoPetrolUsed = true; }
-  }
-  const payload = { telegram_user_id: msg.from.id, chat_id: msg.chat.id, ...parsed, created_at: nowIso(), updated_at: nowIso() };
-  const { error } = await supabase.from('phv_logs').insert(payload);
-  if (error) { console.error(error); return send(msg.chat.id, 'Could not save PHV log.'); }
-  const c = phvComputed(payload);
-  const allLogs = await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString());
-  const comparable = summarizeComparableSessions(allLogs, getDayType(parsed.log_date), parsed.log_date);
-  const score = scoreSession(c.hourlyNet);
-  const lines = [
-    '<b>PHV log saved</b>',
-    `Date: <b>${escapeHtml(parsed.log_date)}</b>`,
-    `Gross: <b>${currency(c.gross)}</b>`,
-    `Petrol: <b>${currency(c.petrol)}</b>`,
-    `Net: <b>${currency(c.net)}</b>`,
-    `Hours: <b>${num(c.hours)}</b>`,
-    `Hourly net: <b>${currency(c.hourlyNet)}</b>`,
-    `Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
-  ];
-  if (parsed.km_driven !== null) lines.push(`KM: <b>${num(parsed.km_driven)}</b>`);
-  if (autoPetrolUsed) lines.push(`Petrol source: <b>auto-filled from PHV settings</b>`);
-  lines.push(`Signal: <b>${escapeHtml(buildStopRecommendation(payload, comparable))}</b>`);
-  return send(msg.chat.id, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }]] } });
-}
-async function handlePhvStart(msg, body = '') {
-  await ensureUser(msg);
-  const existing = await getActiveSession(msg.from.id);
-  if (existing) return send(msg.chat.id, `You already have an active PHV session.\nStart mileage: <b>${num(existing.start_mileage, 0)}</b>\nStarted: <b>${escapeHtml(formatDateTime(existing.started_at))}</b>`);
-  const mileage = parseFloat(String(body || '').trim());
-  if (!Number.isFinite(mileage)) return send(msg.chat.id, 'Use: <code>/phvstart 112280</code>');
-  const startedAt = telegramMessageIso(msg);
-  const { error } = await supabase.from('phv_active_session').upsert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, start_mileage: mileage, started_at: startedAt, updated_at: nowIso() }, { onConflict: 'telegram_user_id' });
-  if (error) { console.error(error); return send(msg.chat.id, 'Could not start PHV session.'); }
-  const maintenanceItems = await getMaintenanceItems(msg.from.id);
-  const lines = [
-    '🚗 <b>PHV session started</b>',
-    `Start time: <b>${escapeHtml(formatDateTime(startedAt))}</b>`,
-    `Start mileage: <b>${num(mileage, 0)}</b>`,
-  ];
-  lines.push(...maintenanceWatchLines(maintenanceItems, mileage));
-  return send(msg.chat.id, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '📍 Mid Session', callback_data: 'show:phvnow' }, { text: '🏁 End Session', callback_data: 'show:phvend' }]] } });
-}
-async function handlePhvNow(msg, body) {
-  await ensureUser(msg);
-  const active = await getActiveSession(msg.from.id);
-  if (!active) return send(msg.chat.id, 'No active PHV session found. Use <code>/phvstart starting_mileage</code> first.');
-  const parsed = parsePhvNowBody(body);
-  if (!parsed) return send(msg.chat.id, 'Use: <code>/phvnow gross:62 | current:112314</code> or <code>/phvnow gross:62 | current:112314</code>');
-  const km = parsed.current_mileage - Number(active.start_mileage || 0);
-  if (!(km >= 0)) return send(msg.chat.id, 'Current mileage cannot be lower than start mileage.');
-  const currentAt = telegramMessageIso(msg);
-  const autoHours = durationHoursBetween(active.started_at, currentAt);
-  const effectiveHours = Number.isFinite(parsed.hours_worked) ? parsed.hours_worked : autoHours;
-  if (!Number.isFinite(effectiveHours) || effectiveHours <= 0) return send(msg.chat.id, 'Could not determine hours worked yet. Try again in a few minutes or add <code>hours:x.x</code>.');
-  let petrol = parsed.petrol_cost;
-  if (petrol === null || petrol === undefined) {
-    const settings = await getOrCreatePhvSettings(msg);
-    petrol = calculatePhvPetrolCost(km, settings) ?? 0;
-  }
-  const pseudo = { log_date: todayDateString(), gross_amount: parsed.gross_amount, hours_worked: effectiveHours, petrol_cost: petrol };
-  const c = phvComputed(pseudo);
-  const allLogs = await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString());
-  const comparable = summarizeComparableSessions(allLogs, getDayType(todayDateString()), null);
-  const score = scoreSession(c.hourlyNet);
-  const maintenanceItems = await getMaintenanceItems(msg.from.id);
-  const lines = [
-    '<b>PHV mid-session</b>',
-    `Started: <b>${escapeHtml(formatDateTime(active.started_at))}</b>`,
-    `Checked at: <b>${escapeHtml(formatDateTime(currentAt))}</b>`,
-    `KM so far: <b>${num(km)}</b>`,
-    `Gross so far: <b>${currency(parsed.gross_amount)}</b>`,
-    `Petrol est.: <b>${currency(petrol)}</b>`,
-    `Net so far: <b>${currency(c.net)}</b>`,
-    `Hours so far: <b>${num(effectiveHours)}</b> (${escapeHtml(formatDurationHours(effectiveHours))})`,
-    `Hourly net so far: <b>${currency(c.hourlyNet)}</b>`,
-    `Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
-    `Signal: <b>${escapeHtml(buildStopRecommendation(pseudo, comparable))}</b>`,
-  ];
-  if (parsed.hours_worked === null) lines.push('Hours source: <b>auto from Telegram timestamps</b>');
-  lines.push(...maintenanceWatchLines(maintenanceItems, parsed.current_mileage));
-  return send(msg.chat.id, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '🏁 End Session', callback_data: 'show:phvend' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }]] } });
-}
-async function handlePhvEnd(msg, body) {
-  await ensureUser(msg);
-  const active = await getActiveSession(msg.from.id);
-  if (!active) return send(msg.chat.id, 'No active PHV session found. Use <code>/phvstart starting_mileage</code> first.');
-  const parsed = parsePhvEnd(body);
-  if (!parsed) return send(msg.chat.id, 'Use: <code>/phvend 112348 | gross:145</code> or <code>/phvend 112348 | gross:145</code>');
-  const km = parsed.end_mileage - Number(active.start_mileage || 0);
-  if (!(km >= 0)) return send(msg.chat.id, 'End mileage cannot be lower than start mileage.');
-  const endedAt = telegramMessageIso(msg);
-  const autoHours = durationHoursBetween(active.started_at, endedAt);
-  const effectiveHours = Number.isFinite(parsed.hours_worked) ? parsed.hours_worked : autoHours;
-  if (!Number.isFinite(effectiveHours) || effectiveHours <= 0) return send(msg.chat.id, 'Could not determine hours worked yet. Try again in a few minutes or add <code>hours:x.x</code>.');
-  let petrol = parsed.petrol_cost;
-  let autoPetrol = false;
-  if (petrol === null || petrol === undefined) {
-    const settings = await getOrCreatePhvSettings(msg);
-    petrol = calculatePhvPetrolCost(km, settings) ?? 0;
-    autoPetrol = true;
-  }
-  const payload = {
-    telegram_user_id: msg.from.id,
-    chat_id: msg.chat.id,
-    log_date: parsed.log_date,
-    gross_amount: parsed.gross_amount,
-    hours_worked: effectiveHours,
-    km_driven: km,
-    petrol_cost: petrol,
-    start_mileage: Number(active.start_mileage),
-    end_mileage: parsed.end_mileage,
-    notes: parsed.notes,
-    created_at: nowIso(),
-    updated_at: nowIso(),
-  };
-  const { error: insertErr } = await supabase.from('phv_logs').insert(payload);
-  if (insertErr) { console.error(insertErr); return send(msg.chat.id, 'Could not save PHV session end log.'); }
-  const { error: delErr } = await supabase.from('phv_active_session').delete().eq('telegram_user_id', msg.from.id);
-  if (delErr) console.error(delErr);
-  const maintenanceItems = await getMaintenanceItems(msg.from.id);
-  const c = phvComputed(payload);
-  const allLogs = await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString());
-  const comparable = summarizeComparableSessions(allLogs, getDayType(payload.log_date), payload.log_date);
-  const score = scoreSession(c.hourlyNet);
-  const lines = [
-    '<b>PHV session ended</b>',
-    `Start time: <b>${escapeHtml(formatDateTime(active.started_at))}</b>`,
-    `End time: <b>${escapeHtml(formatDateTime(endedAt))}</b>`,
-    `Duration: <b>${escapeHtml(formatDurationHours(effectiveHours))}</b>`,
-    `Start mileage: <b>${num(active.start_mileage, 0)}</b>`,
-    `End mileage: <b>${num(parsed.end_mileage, 0)}</b>`,
-    `Session KM: <b>${num(km)}</b>`,
-    `Gross: <b>${currency(payload.gross_amount)}</b>`,
-    `Petrol: <b>${currency(petrol)}</b>`,
-    `Net: <b>${currency(c.net)}</b>`,
-    `Hours: <b>${num(payload.hours_worked)}</b>`,
-    `Hourly net: <b>${currency(c.hourlyNet)}</b>`,
-    `Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
-    `Signal: <b>${escapeHtml(buildStopRecommendation(payload, comparable))}</b>`,
-  ];
-  if (parsed.hours_worked === null) lines.push('Hours source: <b>auto from Telegram timestamps</b>');
-  if (autoPetrol) lines.push('Petrol source: <b>auto-filled from PHV settings</b>');
-  lines.push(...maintenanceWatchLines(maintenanceItems, parsed.end_mileage));
-  return send(msg.chat.id, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '🛠 Maintenance', callback_data: 'show:maintstatus' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }]] } });
-}
-async function handlePhvToday(msg, editContext = null) {
-  await ensureUser(msg);
-  const logs = await getPhvRange(msg.from.id, todayDateString(), todayDateString());
-  if (!logs.length) return editContext ? editOrSend(msg.chat.id, editContext.messageId, 'No PHV logs for today yet.', { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, 'No PHV logs for today yet.', { reply_markup: MAIN_KEYBOARD });
-  const s = summarizePhv(logs);
-  const score = scoreSession(s.hourlyNet);
-  const comparable = summarizeComparableSessions(await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString()), getDayType(todayDateString()), todayDateString());
-  const text = [
-    '<b>PHV today</b>',
-    `Entries: <b>${s.count}</b>`,
-    `Gross: <b>${currency(s.gross)}</b>`,
-    `Petrol: <b>${currency(s.petrol)}</b>`,
-    `Net: <b>${currency(s.net)}</b>`,
-    `Hours: <b>${num(s.hours)}</b>`,
-    `Hourly net: <b>${currency(s.hourlyNet)}</b>`,
-    `Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
-    `Signal: <b>${escapeHtml(buildStopRecommendation({ log_date: todayDateString(), gross_amount: s.gross, petrol_cost: s.petrol, hours_worked: s.hours }, comparable))}</b>`,
-  ].join('\n');
-  const opts = { reply_markup: { inline_keyboard: [[{ text: '📈 PHV Week', callback_data: 'show:phvweek' }, { text: '❓ Should I Drive', callback_data: 'show:shoulddrive' }]] } };
-  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, opts) : send(msg.chat.id, text, opts);
-}
-async function handlePhvWeek(msg, editContext = null) {
-  await ensureUser(msg);
-  const end = todayDateString();
-  const start = addDays(end, -6);
-  const logs = await getPhvRange(msg.from.id, start, end);
-  if (!logs.length) return editContext ? editOrSend(msg.chat.id, editContext.messageId, 'No PHV logs in the past 7 days yet.', { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, 'No PHV logs in the past 7 days yet.', { reply_markup: MAIN_KEYBOARD });
-  const s = summarizePhv(logs);
-  const score = scoreSession(s.hourlyNet);
-  const weekday = summarizePhv(logs.filter((x) => getDayType(x.log_date) === 'weekday'));
-  const weekend = summarizePhv(logs.filter((x) => getDayType(x.log_date) === 'weekend'));
-  const text = [
-    '<b>PHV past 7 days</b>',
-    `Range: <b>${escapeHtml(start)}</b> to <b>${escapeHtml(end)}</b>`,
-    `Entries: <b>${s.count}</b>`,
-    `Gross: <b>${currency(s.gross)}</b>`,
-    `Petrol: <b>${currency(s.petrol)}</b>`,
-    `Net: <b>${currency(s.net)}</b>`,
-    `Hours: <b>${num(s.hours)}</b>`,
-    `Avg hourly net: <b>${currency(s.hourlyNet)}</b>`,
-    `Overall score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
-    '',
-    '<b>Weekday vs weekend</b>',
-    `• Weekday avg hourly net: <b>${currency(weekday.hourlyNet)}</b> from <b>${weekday.count}</b> log(s)`,
-    `• Weekend avg hourly net: <b>${currency(weekend.hourlyNet)}</b> from <b>${weekend.count}</b> log(s)`,
-  ].join('\n');
-  const opts = { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '❓ Should I Drive', callback_data: 'show:shoulddrive' }], [{ text: '🛠 Maintenance', callback_data: 'show:maintstatus' }]] } };
-  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, opts) : send(msg.chat.id, text, opts);
-}
-async function handleShouldDrive(msg, editContext = null) {
-  await ensureUser(msg);
-  const logs = await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString());
-  const dayType = getDayType(todayDateString());
-  const comparable = summarizeComparableSessions(logs, dayType, todayDateString());
-  const advice = buildShouldDriveAdvice(dayType, comparable);
-  const text = [
-    '<b>Should I drive today?</b>',
-    `Today type: <b>${escapeHtml(dayType)}</b>`,
-    `Comparable sessions used: <b>${comparable.count}</b>`,
-    `Recent avg hourly net: <b>${currency(comparable.hourlyNet)}</b>`,
-    '',
-    `<b>${escapeHtml(advice.headline)}</b>`,
-    `• ${escapeHtml(advice.recommendation)}`,
-    `• Confidence: <b>${escapeHtml(advice.confidence)}</b>`,
-  ].join('\n');
-  const opts = { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
-  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, opts) : send(msg.chat.id, text, opts);
-}
-
 function buildDecisionAdvice(prompt) {
   const text = String(prompt || '').toLowerCase();
   const isDelay = /(wait|later|delay|postpone)/.test(text);
