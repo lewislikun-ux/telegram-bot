@@ -28,32 +28,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const pendingInputs = new Map();
 const pendingReceiptActions = new Map();
 
-const runtimeCache = {
-  supports: { value: null, expiresAt: 0 },
-  grantUpdates: { value: null, expiresAt: 0 },
-  news: { value: null, expiresAt: 0 },
-};
-
-function getCachedValue(bucketName) {
-  const bucket = runtimeCache[bucketName];
-  if (!bucket) return null;
-  if (bucket.value && bucket.expiresAt > Date.now()) return bucket.value;
-  return null;
-}
-function setCachedValue(bucketName, value, ttlMs) {
-  const bucket = runtimeCache[bucketName];
-  if (!bucket) return value;
-  bucket.value = value;
-  bucket.expiresAt = Date.now() + ttlMs;
-  return value;
-}
-function clearCachedValue(bucketName) {
-  const bucket = runtimeCache[bucketName];
-  if (!bucket) return;
-  bucket.value = null;
-  bucket.expiresAt = 0;
-}
-
 
 process.on('unhandledRejection', (err) => {
   console.error('Unhandled rejection:', err);
@@ -200,10 +174,6 @@ const MAIN_KEYBOARD = {
     [
       { text: '⛽ PHV Settings', callback_data: 'show:phvsettings' },
       { text: '🛠 Maintenance', callback_data: 'show:maintstatus' },
-    ],
-    [
-      { text: '🏛 Grants', callback_data: 'show:grants' },
-      { text: '📢 Grant Updates', callback_data: 'show:grantupdates' },
     ],
   ],
 };
@@ -620,16 +590,8 @@ async function showHelp(chatId) {
     '<code>/maintenance</code>',
     '<code>/maintdone item | mileage | optional_cost | optional_note</code>',
     '',
-    '<b>Grants intelligence</b>',
-    '<code>/grants</code>',
-    '<code>/support</code>',
-    '<code>/linkhub</code>',
-    '<code>/latestgrants</code>',
-    '<code>/industrygrant f&b</code>',
-    '<code>/matchgrant retail wants chatbot</code>',
     '<code>/gm</code>',
-    '<code>/refreshnews</code>',
-    '<code>/refreshgrants</code>',
+    '<code>/news</code>',
     '',
     '<b>OCR</b>',
     'Send a receipt screenshot/photo with a caption like <code>fuel</code>, <code>maintenance</code>, or <code>insurance</code>. The bot will OCR it and suggest what to save.',
@@ -1136,10 +1098,6 @@ function parseNaturalLanguage(text) {
   if (/^phv settings$/i.test(trimmed)) return { type: 'phvsettings' };
   if (/^(should i drive|drive today\??)$/i.test(trimmed)) return { type: 'shoulddrive' };
   if (/^(good morning|gm)$/i.test(trimmed)) return { type: 'gm' };
-  if (/^(grants|grant directory)$/i.test(trimmed)) return { type: 'grants' };
-  if (/^(latest grants|grant updates)$/i.test(trimmed)) return { type: 'latestgrants' };
-  if (/^(support|supportable programmes)$/i.test(trimmed)) return { type: 'support' };
-  if (/^(link hub|linkhub)$/i.test(trimmed)) return { type: 'linkhub' };
   return null;
 }
 async function handleNaturalLanguage(msg, parsed) {
@@ -1162,10 +1120,6 @@ async function handleNaturalLanguage(msg, parsed) {
     case 'phvsettings': return handlePhvSettings(msg);
     case 'shoulddrive': return handleShouldDrive(msg);
     case 'gm': return handleGrantDigest(msg);
-    case 'grants': return handleGrants(msg);
-    case 'latestgrants': return handleLatestGrants(msg);
-    case 'support': return handleSupport(msg);
-    case 'linkhub': return handleLinkHub(msg);
     case 'maintenance': return handleMaintenance(msg);
     case 'addmaintenance': return handleAddMaintenance(msg, parsed.body);
     case 'maintdone': return handleMaintDone(msg, parsed.body);
@@ -1189,50 +1143,32 @@ function detectIndustryAlias(text = '') {
   return null;
 }
 
-async function getActiveSupports(limit = 80, options = {}) {
-  const useCache = options.useCache !== false;
-  const cacheKey = 'supports';
-  const cached = useCache ? getCachedValue(cacheKey) : null;
-  if (cached) return cached.slice(0, limit);
-
+async function getActiveSupports(limit = 80) {
   const { data, error } = await supabase
     .from('grants_master')
     .select('*')
     .eq('status', 'active')
     .order('priority', { ascending: false, nullsFirst: false })
     .order('name', { ascending: true })
-    .limit(Math.max(limit, 80));
-
+    .limit(limit);
   if (error) {
     console.error(error);
-    return cached ? cached.slice(0, limit) : [];
+    return [];
   }
-
-  const items = data || [];
-  setCachedValue(cacheKey, items, 5 * 60 * 1000);
-  return items.slice(0, limit);
+  return data || [];
 }
 
-async function getLatestGrantUpdates(limit = 8, options = {}) {
-  const useCache = options.useCache !== false;
-  const cacheKey = 'grantUpdates';
-  const cached = useCache ? getCachedValue(cacheKey) : null;
-  if (cached) return cached.slice(0, limit);
-
+async function getLatestGrantUpdates(limit = 8) {
   const { data, error } = await supabase
     .from('grant_updates')
     .select('*')
     .order('created_at', { ascending: false })
-    .limit(Math.max(limit, 20));
-
+    .limit(limit);
   if (error) {
     console.error(error);
-    return cached ? cached.slice(0, limit) : [];
+    return [];
   }
-
-  const items = data || [];
-  setCachedValue(cacheKey, items, 5 * 60 * 1000);
-  return items.slice(0, limit);
+  return data || [];
 }
 
 function formatSupportDirectory(items, title = 'Grants & Support') {
@@ -1446,30 +1382,19 @@ async function buildPhvTodaySnapshotText(userId) {
   ].join('\n');
 }
 
-async function fetchTopNewsHeadlines(limit = 5, options = {}) {
-  const useCache = options.useCache !== false;
-  const cached = useCache ? getCachedValue('news') : null;
-  if (cached) return cached.slice(0, limit);
-
+async function fetchTopNewsHeadlines(limit = 5) {
   const sources = [
     'https://news.google.com/rss?hl=en-SG&gl=SG&ceid=SG:en',
     'https://www.channelnewsasia.com/rssfeeds/8395986'
   ];
-
   for (const url of sources) {
     try {
-      const response = await axios.get(url, {
-        timeout: 8000,
-        responseType: 'text',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 TelegramBot/1.0'
-        }
-      });
+      const response = await axios.get(url, { timeout: 10000, responseType: 'text' });
       const xml = String(response.data || '');
       const headlines = [];
       const itemRegex = /<item>[\s\S]*?<title><!\[CDATA\[(.*?)\]\]><\/title>[\s\S]*?<\/item>|<item>[\s\S]*?<title>(.*?)<\/title>[\s\S]*?<\/item>/gi;
       let match;
-      while ((match = itemRegex.exec(xml)) && headlines.length < Math.max(limit, 8)) {
+      while ((match = itemRegex.exec(xml)) && headlines.length < limit) {
         const raw = (match[1] || match[2] || '').trim();
         if (!raw) continue;
         const cleaned = raw
@@ -1477,20 +1402,15 @@ async function fetchTopNewsHeadlines(limit = 5, options = {}) {
           .replace(/&lt;/g, '<')
           .replace(/&gt;/g, '>')
           .replace(/\s+-\s+[^-]+$/, '')
-          .replace(/^Google News$/i, '')
           .trim();
         if (cleaned && !headlines.includes(cleaned)) headlines.push(cleaned);
       }
-      if (headlines.length) {
-        setCachedValue('news', headlines, 10 * 60 * 1000);
-        return headlines.slice(0, limit);
-      }
+      if (headlines.length) return headlines.slice(0, limit);
     } catch (err) {
       console.error('News fetch failed:', err.message);
     }
   }
-
-  return cached ? cached.slice(0, limit) : [];
+  return [];
 }
 
 function buildNewsSnapshotText(headlines) {
@@ -1507,30 +1427,20 @@ function buildNewsSnapshotText(headlines) {
 
 async function handleGrantDigest(msg) {
   await ensureUser(msg);
-  const [dueData, phvText, headlines, activeSession] = await Promise.all([
+  const [{ reminders, adminItems }, phvText, headlines] = await Promise.all([
     getDueItems(msg.from.id),
     buildPhvTodaySnapshotText(msg.from.id),
     fetchTopNewsHeadlines(5),
-    getActiveSession(msg.from.id).catch(() => null),
   ]);
-
   const lines = [
     '<b>Good morning ☀️</b>',
     '',
     buildNewsSnapshotText(headlines),
     '',
-    buildDueSnapshotText(dueData.reminders, dueData.adminItems),
+    buildDueSnapshotText(reminders, adminItems),
     '',
     phvText,
   ];
-
-  if (activeSession) {
-    lines.push('');
-    lines.push(`<b>🟢 Active PHV session</b>`);
-    lines.push(`• Started: ${escapeHtml(formatDateTime(activeSession.started_at))}`);
-    lines.push(`• Start mileage: <b>${num(activeSession.start_mileage, 0)}</b>`);
-  }
-
   return send(msg.chat.id, lines.join('\n'), { reply_markup: MAIN_KEYBOARD });
 }
 
@@ -1657,20 +1567,8 @@ async function routeMessage(msg) {
     case '/phvweek': return handlePhvWeek(msg);
     case '/phvsettings': return handlePhvSettings(msg);
     case '/shoulddrive': return handleShouldDrive(msg);
-    case '/grants': return handleGrants(msg);
-    case '/support': return handleSupport(msg);
-    case '/linkhub': return handleLinkHub(msg);
-    case '/latestgrants': return handleLatestGrants(msg);
-    case '/industrygrant': return handleIndustryGrant(msg, body);
-    case '/matchgrant': return handleMatchGrant(msg, body);
-    case '/gm': return handleGrantDigest(msg);
-    case '/refreshnews':
-      clearCachedValue('news');
-      return send(msg.chat.id, 'News cache cleared. Next GM/news fetch will refresh.');
-    case '/refreshgrants':
-      clearCachedValue('supports');
-      clearCachedValue('grantUpdates');
-      return send(msg.chat.id, 'Grants cache cleared. Next grants fetch will refresh.');
+    case '/gm':
+    case '/news': return handleGrantDigest(msg);
     case '/decide': return handleDecide(msg, body);
     case '/addmaintenance': return handleAddMaintenance(msg, body);
     case '/maintenance':
@@ -1693,8 +1591,6 @@ async function routeCallback(query) {
     if (data === 'show:phvsettings') return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:shoulddrive') return handleShouldDrive(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:maintstatus') return handleMaintenance(fauxMsg, { messageId: msg.message_id });
-    if (data === 'show:grants') return handleGrants(fauxMsg, { messageId: msg.message_id });
-    if (data === 'show:grantupdates') return handleLatestGrants(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:phvstart') {
       pendingInputs.set(query.from.id, { kind: 'phvstart' });
       return send(msg.chat.id, 'Send your starting mileage. Example: <code>112280</code>');
@@ -1764,32 +1660,7 @@ async function routeCallback(query) {
 }
 
 app.get('/', (_req, res) => res.send('Bot is running.'));
-app.get('/health', async (_req, res) => {
-  let webhookInfo = null;
-  try {
-    webhookInfo = await bot.getWebHookInfo();
-  } catch (err) {
-    webhookInfo = { error: err.message };
-  }
-  res.status(200).json({
-    ok: true,
-    date: new Date().toISOString(),
-    cache: {
-      supports: !!getCachedValue('supports'),
-      grantUpdates: !!getCachedValue('grantUpdates'),
-      news: !!getCachedValue('news'),
-    },
-    webhook: webhookInfo,
-  });
-});
-app.get('/webhook-status', async (_req, res) => {
-  try {
-    const info = await bot.getWebHookInfo();
-    res.status(200).json(info);
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
+app.get('/health', (_req, res) => res.status(200).send('ok'));
 app.post(`/webhook/${TELEGRAM_BOT_TOKEN}`, async (req, res) => {
   try {
     const update = req.body;
