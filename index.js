@@ -28,6 +28,14 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const pendingInputs = new Map();
 const pendingReceiptActions = new Map();
 
+
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+});
+
 function escapeHtml(text = '') {
   return String(text)
     .replace(/&/g, '&amp;')
@@ -169,11 +177,7 @@ const MAIN_KEYBOARD = {
     ],
     [
       { text: '🏛 Grants', callback_data: 'show:grants' },
-      { text: '🆕 Grant Updates', callback_data: 'show:latestgrants' },
-    ],
-    [
-      { text: '🏭 By Industry', callback_data: 'show:industryhelp' },
-      { text: '🔗 Link Hub', callback_data: 'show:linkhub' },
+      { text: '📢 Grant Updates', callback_data: 'show:grantupdates' },
     ],
   ],
 };
@@ -537,313 +541,415 @@ function phvSettingsText(settings) {
   ].join('\n');
 }
 
-
-
-async function getGrantSupports(limit = 40) {
-  const { data, error } = await supabase
-    .from('grants_master')
-    .select('*')
-    .eq('status', 'active')
-    .order('priority', { ascending: false, nullsFirst: false })
-    .order('category', { ascending: true })
-    .order('name', { ascending: true })
-    .limit(limit);
-  if (error) throw error;
-  return data || [];
-}
-async function getGrantUpdates(limit = 8) {
-  const { data, error } = await supabase
-    .from('grant_updates')
-    .select('*')
-    .order('effective_date', { ascending: false, nullsFirst: false })
-    .order('created_at', { ascending: false })
-    .limit(limit);
-  if (error) throw error;
-  return data || [];
-}
-function groupGrantSupports(items) {
-  const grouped = {};
-  (items || []).forEach((item) => {
-    const key = item.category || 'Other';
-    if (!grouped[key]) grouped[key] = [];
-    grouped[key].push(item);
-  });
-  return grouped;
-}
-function normalizeGrantKeyword(value) {
-  return String(value || '').trim().toLowerCase();
-}
-const GRANT_INDUSTRY_ALIASES = {
-  'fnb': 'f&b',
-  'food and beverage': 'f&b',
-  'food': 'f&b',
-  'retail shop': 'retail',
-  'shop': 'retail',
-  'factory': 'manufacturing',
-  'maker': 'manufacturing',
-  'service': 'services',
-  'startup company': 'startup',
-  'new business': 'startup',
-};
-const GRANT_PROBLEM_PATTERNS = [
-  { tag: 'digitalisation', keywords: ['digital', 'software', 'system', 'crm', 'pos', 'erp', 'hr', 'accounting', 'qr ordering'] },
-  { tag: 'automation', keywords: ['automation', 'automate', 'chatbot', 'ai', 'analytics'] },
-  { tag: 'business transformation', keywords: ['branding', 'growth', 'transformation', 'consultancy', 'strategy', 'process'] },
-  { tag: 'overseas expansion', keywords: ['overseas', 'export', 'market entry', 'internationalisation', 'distributor'] },
-  { tag: 'energy saving', keywords: ['aircon', 'chiller', 'energy', 'utility', 'equipment', 'efficiency'] },
-  { tag: 'product development', keywords: ['product development', 'testing', 'shelf life', 'pilot', 'formulation'] },
-  { tag: 'workforce training', keywords: ['training', 'upskill', 'reskill', 'skillsfuture', 'course'] },
-];
-function grantArray(value) {
-  return Array.isArray(value) ? value : [];
-}
-function grantSupportsIndustry(item, industry) {
-  if (!industry) return true;
-  const list = grantArray(item.industries).map(normalizeGrantKeyword);
-  return list.includes('all') || list.includes(normalizeGrantKeyword(industry));
-}
-function detectIndustryFromText(text) {
-  const q = normalizeGrantKeyword(text);
-  const aliasHit = Object.keys(GRANT_INDUSTRY_ALIASES).find((key) => q.includes(key));
-  if (aliasHit) return GRANT_INDUSTRY_ALIASES[aliasHit];
-  const candidates = ['f&b', 'retail', 'manufacturing', 'services', 'startup'];
-  return candidates.find((x) => q.includes(x)) || null;
-}
-function detectProblemTags(text) {
-  const q = normalizeGrantKeyword(text);
-  return GRANT_PROBLEM_PATTERNS
-    .filter((row) => row.keywords.some((kw) => q.includes(kw)))
-    .map((row) => row.tag);
-}
-function scoreGrantMatch(item, queryText, detectedIndustry = null, detectedTags = []) {
-  const q = normalizeGrantKeyword(queryText);
-  if (!q) return 0;
-  let score = 0;
-  const keywords = grantArray(item.keywords);
-  keywords.forEach((kw) => {
-    const k = normalizeGrantKeyword(kw);
-    if (!k) return;
-    if (q.includes(k)) score += Math.max(3, k.split(' ').length);
-  });
-  if (detectedIndustry && grantSupportsIndustry(item, detectedIndustry)) score += 4;
-  const itemTags = grantArray(item.problem_solved).map(normalizeGrantKeyword);
-  detectedTags.forEach((tag) => {
-    if (itemTags.includes(normalizeGrantKeyword(tag))) score += 4;
-  });
-  const haystacks = [item.name, item.category, item.description, item.support_type, item.agency].map((x) => normalizeGrantKeyword(x));
-  haystacks.forEach((field) => {
-    if (field && q.includes(field)) score += 2;
-    else if (field && field.split(' ').some((token) => token && q.includes(token))) score += 1;
-  });
-  if ((item.support_type || '').toLowerCase() === 'grant') score += 1;
-  if (Number.isFinite(Number(item.priority))) score += Number(item.priority) / 10;
-  return score;
-}
-function formatGrantSupportLine(item, { includeWebpage = true, includeMeta = true } = {}) {
-  const lines = [`• <b>${escapeHtml(item.name || 'Untitled')}</b>`];
-  const meta = [];
-  if (includeMeta && item.support_type) meta.push(item.support_type);
-  if (includeMeta && item.agency) meta.push(item.agency);
-  if (meta.length) lines.push(`  ${escapeHtml(meta.join(' · '))}`);
-  if (item.description) lines.push(`  ${escapeHtml(item.description)}`);
-  if (item.eligibility_summary) lines.push(`  Who should use this: ${escapeHtml(item.eligibility_summary)}`);
-  if (includeWebpage && item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
-  return lines.join('\n');
-}
-function formatGrantSupportList(items, { title = '<b>Grants & Support</b>', compact = false } = {}) {
-  if (!items.length) return `${title}\n\nNo active grant or programme records found yet.`;
-  const grouped = groupGrantSupports(items);
-  const lines = [title, ''];
-  Object.keys(grouped).sort().forEach((category) => {
-    lines.push(`<b>${escapeHtml(category)}</b>`);
-    grouped[category].forEach((item) => lines.push(formatGrantSupportLine(item, { includeWebpage: !compact, includeMeta: true })));
-    lines.push('');
-  });
-  return lines.join('\n').trim();
-}
-function formatGrantLinkHub(items) {
-  if (!items.length) return '<b>Grant Link Hub</b>\n\nNo active records found yet.';
-  const grouped = groupGrantSupports(items);
-  const lines = ['<b>Grant Link Hub</b>', '', 'One-stop list of grants, programmes, FIRCs and IHL support links.', ''];
-  Object.keys(grouped).sort().forEach((category) => {
-    lines.push(`<b>${escapeHtml(category)}</b>`);
-    grouped[category].forEach((item) => {
-      lines.push(`• <b>${escapeHtml(item.name || 'Untitled')}</b>`);
-      if (item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
-    });
-    lines.push('');
-  });
-  return lines.join('\n').trim();
-}
-function formatGrantUpdates(updates) {
-  if (!updates.length) return '<b>Latest grant updates</b>\n\nNo update records found yet.';
-  const lines = ['<b>Latest grant updates</b>', ''];
-  updates.forEach((item) => {
-    lines.push(`• <b>${escapeHtml(item.title || 'Untitled update')}</b>`);
-    if (item.summary) lines.push(`  ${escapeHtml(item.summary)}`);
-    if (item.client_angle) lines.push(`  Useful for clients: ${escapeHtml(item.client_angle)}`);
-    if (item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
-  });
-  return lines.join('\n');
-}
-function buildSupportStackFromMatches(matches) {
-  const buckets = {
-    funding: [],
-    execution: [],
-    capability: [],
-  };
-  matches.forEach((item) => {
-    const level = normalizeGrantKeyword(item.support_level || item.category);
-    if (level.includes('funding') || level.includes('grant') || (item.support_type || '').toLowerCase() === 'grant') buckets.funding.push(item);
-    else if (level.includes('execution') || level.includes('centre') || level.includes('programme')) buckets.execution.push(item);
-    else buckets.capability.push(item);
-  });
-  return buckets;
-}
-async function handleGrants(msg, editContext = null) {
+async function handleStart(msg) {
   await ensureUser(msg);
-  try {
-    const items = await getGrantSupports();
-    const text = formatGrantSupportList(items);
-    const extra = { reply_markup: { inline_keyboard: [[{ text: '🆕 Grant Updates', callback_data: 'show:latestgrants' }, { text: '🔗 Link Hub', callback_data: 'show:linkhub' }], [{ text: '🏭 By Industry', callback_data: 'show:industryhelp' }, { text: '➕ Menu', callback_data: 'show:menu' }]] } };
-    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, extra) : send(msg.chat.id, text, extra);
-  } catch (err) {
-    console.error(err);
-    return send(msg.chat.id, 'Could not load grants and support items.');
-  }
-}
-async function handleGrantUpdates(msg, editContext = null) {
-  await ensureUser(msg);
-  try {
-    const updates = await getGrantUpdates();
-    const text = formatGrantUpdates(updates);
-    const extra = { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🔗 Link Hub', callback_data: 'show:linkhub' }], [{ text: '🏭 By Industry', callback_data: 'show:industryhelp' }, { text: '➕ Menu', callback_data: 'show:menu' }]] } };
-    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, extra) : send(msg.chat.id, text, extra);
-  } catch (err) {
-    console.error(err);
-    return send(msg.chat.id, 'Could not load grant updates.');
-  }
-}
-async function handleGrantLinkHub(msg, editContext = null) {
-  await ensureUser(msg);
-  try {
-    const items = await getGrantSupports();
-    const text = formatGrantLinkHub(items);
-    const extra = { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🆕 Grant Updates', callback_data: 'show:latestgrants' }], [{ text: '🏭 By Industry', callback_data: 'show:industryhelp' }, { text: '➕ Menu', callback_data: 'show:menu' }]] } };
-    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, extra) : send(msg.chat.id, text, extra);
-  } catch (err) {
-    console.error(err);
-    return send(msg.chat.id, 'Could not load the grant link hub.');
-  }
-}
-async function handleIndustryGrant(msg, body, editContext = null) {
-  await ensureUser(msg);
-  const query = String(body || '').trim();
-  if (!query) return send(msg.chat.id, 'Use: <code>/industrygrant f&b</code> or <code>/industrygrant retail</code>');
-  try {
-    const items = await getGrantSupports(100);
-    const industry = detectIndustryFromText(query) || normalizeGrantKeyword(query);
-    const filtered = items.filter((item) => grantSupportsIndustry(item, industry));
-    if (!filtered.length) return send(msg.chat.id, `No support records found for industry: <b>${escapeHtml(query)}</b>`);
-    const text = formatGrantSupportList(filtered, { title: `<b>Support for ${escapeHtml(industry)}</b>`, compact: false });
-    const extra = { reply_markup: { inline_keyboard: [[{ text: '🔗 Link Hub', callback_data: 'show:linkhub' }, { text: '🏛 Grants', callback_data: 'show:grants' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
-    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, extra) : send(msg.chat.id, text, extra);
-  } catch (err) {
-    console.error(err);
-    return send(msg.chat.id, 'Could not load industry-specific support.');
-  }
-}
-async function handleIndustryGrantHelp(msg, editContext = null) {
-  const text = [
-    '<b>Industry lookup</b>',
-    'Use <code>/industrygrant industry</code>',
+  return send(msg.chat.id, [
+    `<b>Hi ${escapeHtml(msg.from.first_name || 'there')}</b>`,
     '',
-    'Examples:',
-    '• <code>/industrygrant f&b</code>',
-    '• <code>/industrygrant retail</code>',
-    '• <code>/industrygrant manufacturing</code>',
-    '• <code>/industrygrant services</code>',
-    '• <code>/industrygrant startup</code>',
+    'This Phase 3 build includes:',
+    '• notes / tasks / reminders',
+    '• admin due tracking',
+    '• PHV settings + PHV logging',
+    '• PHV start / now / end mileage flow',
+    '• mileage-based maintenance tracker',
+    '• screenshot / receipt OCR reader (best effort)',
+    '',
+    'Try:',
+    '<code>/phvstart 112280</code>',
+    '<code>/phvnow gross:62 | current:112314</code>',
+    '<code>/phvend 112348 | gross:145</code>',
+    '<code>/addmaintenance engine servicing | 8000 | 112000</code>',
+    '<code>/phvsettings</code>',
+  ].join('\n'), { reply_markup: MAIN_KEYBOARD });
+}
+async function showHelp(chatId) {
+  return send(chatId, [
+    '<b>Commands</b>',
+    '',
+    '<b>Capture</b>',
+    '<code>/note text</code>',
+    '<code>/idea text</code>',
+    '<code>/task text</code>',
+    '<code>/done keyword</code>',
+    '<code>/search keyword</code>',
+    '',
+    '<b>Reminders / admin</b>',
+    '<code>/remind YYYY-MM-DD HH:MM | message</code>',
+    '<code>/adminadd title | YYYY-MM-DD | none|monthly|yearly | 30,7,1</code>',
+    '<code>/admindone keyword</code>',
+    '<code>/due</code>',
+    '',
+    '<b>PHV</b>',
+    '<code>/phvlog date:2026-03-27 | gross:145 | hours:2.5 | km:68</code>',
+    '<code>/phvstart 112280</code>',
+    '<code>/phvnow gross:62 | current:112314</code>',
+    '<code>/phvend 112348 | gross:145</code>',
+    '<code>/phvtoday</code>',
+    '<code>/phvweek</code>',
+    '<code>/shoulddrive</code>',
+    '<code>/phvsettings</code>',
+    '',
+    '<b>Maintenance</b>',
+    '<code>/addmaintenance item | interval_km | last_done_mileage</code>',
+    '<code>/maintenance</code>',
+    '<code>/maintdone item | mileage | optional_cost | optional_note</code>',
+    '',
+    '<b>Grants intelligence</b>',
+    '<code>/grants</code>',
+    '<code>/support</code>',
+    '<code>/linkhub</code>',
+    '<code>/latestgrants</code>',
+    '<code>/industrygrant f&b</code>',
+    '<code>/matchgrant retail wants chatbot</code>',
+    '<code>/gm</code>',
+    '',
+    '<b>OCR</b>',
+    'Send a receipt screenshot/photo with a caption like <code>fuel</code>, <code>maintenance</code>, or <code>insurance</code>. The bot will OCR it and suggest what to save.',
+  ].join('\n'), { reply_markup: MAIN_KEYBOARD });
+}
+
+async function handleNote(msg, body, noteType = 'note') {
+  if (!body) return send(msg.chat.id, `Use: <code>/${noteType} your text</code>`);
+  await ensureUser(msg);
+  const { error } = await supabase.from('notes').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, note_type: noteType, content: body, created_at: nowIso() });
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not save note.'); }
+  return send(msg.chat.id, `Saved ${escapeHtml(noteType)}:\n<blockquote>${escapeHtml(body)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
+}
+async function handleTask(msg, body) {
+  if (!body) return send(msg.chat.id, 'Use: <code>/task your task</code>');
+  await ensureUser(msg);
+  const { error } = await supabase.from('tasks').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, content: body, status: 'open', created_at: nowIso(), updated_at: nowIso() });
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not save task.'); }
+  return send(msg.chat.id, `Saved task:\n<blockquote>${escapeHtml(body)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
+}
+async function handleDone(msg, keyword) {
+  if (!keyword) return send(msg.chat.id, 'Use: <code>/done keyword</code>');
+  await ensureUser(msg);
+  const { data, error } = await supabase.from('tasks').select('*').eq('telegram_user_id', msg.from.id).eq('status', 'open').ilike('content', `%${keyword}%`).order('created_at', { ascending: false }).limit(1);
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not search tasks.'); }
+  const task = data?.[0];
+  if (!task) return send(msg.chat.id, 'No open task matched that keyword.');
+  const { error: upd } = await supabase.from('tasks').update({ status: 'done', updated_at: nowIso(), completed_at: nowIso() }).eq('id', task.id);
+  if (upd) { console.error(upd); return send(msg.chat.id, 'Could not mark task done.'); }
+  return send(msg.chat.id, `Marked done:\n<blockquote>${escapeHtml(task.content)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
+}
+async function handleSearch(msg, keyword) {
+  if (!keyword) return send(msg.chat.id, 'Use: <code>/search keyword</code>');
+  await ensureUser(msg);
+  const [notesRes, tasksRes, adminRes, phvRes, maintRes] = await Promise.all([
+    supabase.from('notes').select('*').eq('telegram_user_id', msg.from.id).ilike('content', `%${keyword}%`).limit(5),
+    supabase.from('tasks').select('*').eq('telegram_user_id', msg.from.id).ilike('content', `%${keyword}%`).limit(5),
+    supabase.from('admin_items').select('*').eq('telegram_user_id', msg.from.id).ilike('title', `%${keyword}%`).limit(5),
+    supabase.from('phv_logs').select('*').eq('telegram_user_id', msg.from.id).ilike('notes', `%${keyword}%`).limit(5),
+    supabase.from('maintenance_items').select('*').eq('telegram_user_id', msg.from.id).ilike('item_name', `%${keyword}%`).limit(5),
+  ]);
+  const errors = [notesRes.error, tasksRes.error, adminRes.error, phvRes.error, maintRes.error].filter(Boolean);
+  if (errors.length) { console.error(errors); return send(msg.chat.id, 'Search failed.'); }
+  const lines = [`<b>Search results for:</b> ${escapeHtml(keyword)}`, ''];
+  if (notesRes.data?.length) { lines.push('<b>Notes</b>'); notesRes.data.forEach((x) => lines.push(`• [${escapeHtml(x.note_type)}] ${escapeHtml(x.content)}`)); lines.push(''); }
+  if (tasksRes.data?.length) { lines.push('<b>Tasks</b>'); tasksRes.data.forEach((x) => lines.push(`• [${escapeHtml(x.status)}] ${escapeHtml(x.content)}`)); lines.push(''); }
+  if (adminRes.data?.length) { lines.push('<b>Admin items</b>'); adminRes.data.forEach((x) => lines.push(`• ${escapeHtml(x.title)} — ${escapeHtml(x.next_due_date)}`)); lines.push(''); }
+  if (maintRes.data?.length) { lines.push('<b>Maintenance</b>'); maintRes.data.forEach((x) => lines.push(`• ${escapeHtml(x.item_name)} — next due ${escapeHtml(String(x.next_due_mileage))}`)); lines.push(''); }
+  if (phvRes.data?.length) { lines.push('<b>PHV logs</b>'); phvRes.data.forEach((x) => lines.push(`• ${escapeHtml(x.log_date)} — gross ${escapeHtml(currency(x.gross_amount))}`)); }
+  if (lines.length <= 2) return send(msg.chat.id, 'No matches found.');
+  return send(msg.chat.id, lines.join('\n'), { reply_markup: MAIN_KEYBOARD });
+}
+
+async function handleRemind(msg, body) {
+  if (!body || !body.includes('|')) return send(msg.chat.id, 'Use: <code>/remind YYYY-MM-DD HH:MM | message</code>');
+  await ensureUser(msg);
+  const [left, ...rest] = body.split('|');
+  const dt = parseDateTimeInput(left.trim());
+  const content = rest.join('|').trim();
+  if (!dt || !content) return send(msg.chat.id, 'Could not read that reminder.');
+  const { error } = await supabase.from('reminders').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, content, remind_at: dt.iso, status: 'open', created_at: nowIso() });
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not save reminder.'); }
+  return send(msg.chat.id, `Saved reminder for <b>${escapeHtml(dt.date)} ${escapeHtml(dt.time)}</b>:\n<blockquote>${escapeHtml(content)}</blockquote>`, { reply_markup: MAIN_KEYBOARD });
+}
+async function handleAdminAdd(msg, body) {
+  const parsed = parseAdminAdd(body);
+  if (!parsed) return send(msg.chat.id, 'Use: <code>/adminadd title | YYYY-MM-DD | none|monthly|yearly | 30,7,1</code>');
+  await ensureUser(msg);
+  const nextDue = computeNextDueDate(parsed.dueDate, parsed.recurrence);
+  const { error } = await supabase.from('admin_items').insert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, title: parsed.title, base_due_date: parsed.dueDate, next_due_date: nextDue, recurrence: parsed.recurrence, lead_days: parsed.leadDays, is_active: true, created_at: nowIso(), updated_at: nowIso() });
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not save admin item.'); }
+  return send(msg.chat.id, `Saved admin item:\n<b>${escapeHtml(parsed.title)}</b>\nDue: <b>${escapeHtml(nextDue)}</b>\nRecurrence: <b>${escapeHtml(parsed.recurrence)}</b>`, { reply_markup: MAIN_KEYBOARD });
+}
+async function findAdminItem(userId, keyword) {
+  const { data, error } = await supabase.from('admin_items').select('*').eq('telegram_user_id', userId).eq('is_active', true).ilike('title', `%${keyword}%`).order('next_due_date', { ascending: true }).limit(1);
+  if (error) throw error;
+  return data?.[0] || null;
+}
+async function completeAdminItem(chatId, row) {
+  if (!row) return send(chatId, 'Admin item not found.');
+  if (row.recurrence === 'none') {
+    const { error } = await supabase.from('admin_items').update({ is_active: false, updated_at: nowIso() }).eq('id', row.id);
+    if (error) throw error;
+    return send(chatId, `✅ Marked done: <b>${escapeHtml(row.title)}</b>\nNo further reminders for this item.`, { reply_markup: MAIN_KEYBOARD });
+  }
+  const nextDue = computeFollowingDueDate(row.next_due_date, row.recurrence);
+  const { error } = await supabase.from('admin_items').update({ base_due_date: nextDue, next_due_date: nextDue, updated_at: nowIso() }).eq('id', row.id);
+  if (error) throw error;
+  return send(chatId, `✅ Marked done: <b>${escapeHtml(row.title)}</b>\nNext due: <b>${escapeHtml(nextDue)}</b>`, { reply_markup: MAIN_KEYBOARD });
+}
+async function handleAdminDone(msg, keyword) {
+  if (!keyword) return send(msg.chat.id, 'Use: <code>/admindone keyword</code>');
+  await ensureUser(msg);
+  try {
+    const row = await findAdminItem(msg.from.id, keyword);
+    if (!row) return send(msg.chat.id, 'No active admin item matched that keyword.');
+    return completeAdminItem(msg.chat.id, row);
+  } catch (err) {
+    console.error(err);
+    return send(msg.chat.id, 'Could not mark admin item done.');
+  }
+}
+async function handleDue(msg, editContext = null) {
+  await ensureUser(msg);
+  try {
+    const { reminders, adminItems } = await getDueItems(msg.from.id);
+    const text = buildDueText(reminders, adminItems);
+    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: dueButtons(adminItems) }) : send(msg.chat.id, text, { reply_markup: dueButtons(adminItems) });
+  } catch (err) {
+    console.error(err);
+    return send(msg.chat.id, 'Could not load due items.');
+  }
+}
+
+async function handlePhvSettings(msg, editContext = null) {
+  await ensureUser(msg);
+  try {
+    const settings = await getOrCreatePhvSettings(msg);
+    const text = phvSettingsText(settings);
+    return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: phvSettingsButtons(settings) }) : send(msg.chat.id, text, { reply_markup: phvSettingsButtons(settings) });
+  } catch (err) {
+    console.error(err);
+    return send(msg.chat.id, 'Could not load PHV settings.');
+  }
+}
+async function handlePhvLog(msg, body) {
+  const parsed = parsePhvBody(body);
+  if (!parsed) return send(msg.chat.id, 'Use: <code>/phvlog date:2026-03-27 | gross:145 | hours:2.5 | km:68 | petrol:18</code>');
+  await ensureUser(msg);
+  let settings = null;
+  let autoPetrolUsed = false;
+  try { settings = await getOrCreatePhvSettings(msg); } catch (e) { console.error(e); }
+  if ((parsed.petrol_cost === null || parsed.petrol_cost === undefined) && parsed.km_driven !== null && settings) {
+    const autoPetrol = calculatePhvPetrolCost(parsed.km_driven, settings);
+    if (autoPetrol !== null) { parsed.petrol_cost = autoPetrol; autoPetrolUsed = true; }
+  }
+  const payload = { telegram_user_id: msg.from.id, chat_id: msg.chat.id, ...parsed, created_at: nowIso(), updated_at: nowIso() };
+  const { error } = await supabase.from('phv_logs').insert(payload);
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not save PHV log.'); }
+  const c = phvComputed(payload);
+  const allLogs = await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString());
+  const comparable = summarizeComparableSessions(allLogs, getDayType(parsed.log_date), parsed.log_date);
+  const score = scoreSession(c.hourlyNet);
+  const lines = [
+    '<b>PHV log saved</b>',
+    `Date: <b>${escapeHtml(parsed.log_date)}</b>`,
+    `Gross: <b>${currency(c.gross)}</b>`,
+    `Petrol: <b>${currency(c.petrol)}</b>`,
+    `Net: <b>${currency(c.net)}</b>`,
+    `Hours: <b>${num(c.hours)}</b>`,
+    `Hourly net: <b>${currency(c.hourlyNet)}</b>`,
+    `Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
+  ];
+  if (parsed.km_driven !== null) lines.push(`KM: <b>${num(parsed.km_driven)}</b>`);
+  if (autoPetrolUsed) lines.push(`Petrol source: <b>auto-filled from PHV settings</b>`);
+  lines.push(`Signal: <b>${escapeHtml(buildStopRecommendation(payload, comparable))}</b>`);
+  return send(msg.chat.id, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }]] } });
+}
+async function handlePhvStart(msg, body = '') {
+  await ensureUser(msg);
+  const existing = await getActiveSession(msg.from.id);
+  if (existing) return send(msg.chat.id, `You already have an active PHV session.\nStart mileage: <b>${num(existing.start_mileage, 0)}</b>\nStarted: <b>${escapeHtml(formatDateTime(existing.started_at))}</b>`);
+  const mileage = parseFloat(String(body || '').trim());
+  if (!Number.isFinite(mileage)) return send(msg.chat.id, 'Use: <code>/phvstart 112280</code>');
+  const startedAt = telegramMessageIso(msg);
+  const { error } = await supabase.from('phv_active_session').upsert({ telegram_user_id: msg.from.id, chat_id: msg.chat.id, start_mileage: mileage, started_at: startedAt, updated_at: nowIso() }, { onConflict: 'telegram_user_id' });
+  if (error) { console.error(error); return send(msg.chat.id, 'Could not start PHV session.'); }
+  const maintenanceItems = await getMaintenanceItems(msg.from.id);
+  const lines = [
+    '🚗 <b>PHV session started</b>',
+    `Start time: <b>${escapeHtml(formatDateTime(startedAt))}</b>`,
+    `Start mileage: <b>${num(mileage, 0)}</b>`,
+  ];
+  lines.push(...maintenanceWatchLines(maintenanceItems, mileage));
+  return send(msg.chat.id, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '📍 Mid Session', callback_data: 'show:phvnow' }, { text: '🏁 End Session', callback_data: 'show:phvend' }]] } });
+}
+async function handlePhvNow(msg, body) {
+  await ensureUser(msg);
+  const active = await getActiveSession(msg.from.id);
+  if (!active) return send(msg.chat.id, 'No active PHV session found. Use <code>/phvstart starting_mileage</code> first.');
+  const parsed = parsePhvNowBody(body);
+  if (!parsed) return send(msg.chat.id, 'Use: <code>/phvnow gross:62 | current:112314</code> or <code>/phvnow gross:62 | current:112314</code>');
+  const km = parsed.current_mileage - Number(active.start_mileage || 0);
+  if (!(km >= 0)) return send(msg.chat.id, 'Current mileage cannot be lower than start mileage.');
+  const currentAt = telegramMessageIso(msg);
+  const autoHours = durationHoursBetween(active.started_at, currentAt);
+  const effectiveHours = Number.isFinite(parsed.hours_worked) ? parsed.hours_worked : autoHours;
+  if (!Number.isFinite(effectiveHours) || effectiveHours <= 0) return send(msg.chat.id, 'Could not determine hours worked yet. Try again in a few minutes or add <code>hours:x.x</code>.');
+  let petrol = parsed.petrol_cost;
+  if (petrol === null || petrol === undefined) {
+    const settings = await getOrCreatePhvSettings(msg);
+    petrol = calculatePhvPetrolCost(km, settings) ?? 0;
+  }
+  const pseudo = { log_date: todayDateString(), gross_amount: parsed.gross_amount, hours_worked: effectiveHours, petrol_cost: petrol };
+  const c = phvComputed(pseudo);
+  const allLogs = await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString());
+  const comparable = summarizeComparableSessions(allLogs, getDayType(todayDateString()), null);
+  const score = scoreSession(c.hourlyNet);
+  const maintenanceItems = await getMaintenanceItems(msg.from.id);
+  const lines = [
+    '<b>PHV mid-session</b>',
+    `Started: <b>${escapeHtml(formatDateTime(active.started_at))}</b>`,
+    `Checked at: <b>${escapeHtml(formatDateTime(currentAt))}</b>`,
+    `KM so far: <b>${num(km)}</b>`,
+    `Gross so far: <b>${currency(parsed.gross_amount)}</b>`,
+    `Petrol est.: <b>${currency(petrol)}</b>`,
+    `Net so far: <b>${currency(c.net)}</b>`,
+    `Hours so far: <b>${num(effectiveHours)}</b> (${escapeHtml(formatDurationHours(effectiveHours))})`,
+    `Hourly net so far: <b>${currency(c.hourlyNet)}</b>`,
+    `Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
+    `Signal: <b>${escapeHtml(buildStopRecommendation(pseudo, comparable))}</b>`,
+  ];
+  if (parsed.hours_worked === null) lines.push('Hours source: <b>auto from Telegram timestamps</b>');
+  lines.push(...maintenanceWatchLines(maintenanceItems, parsed.current_mileage));
+  return send(msg.chat.id, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '🏁 End Session', callback_data: 'show:phvend' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }]] } });
+}
+async function handlePhvEnd(msg, body) {
+  await ensureUser(msg);
+  const active = await getActiveSession(msg.from.id);
+  if (!active) return send(msg.chat.id, 'No active PHV session found. Use <code>/phvstart starting_mileage</code> first.');
+  const parsed = parsePhvEnd(body);
+  if (!parsed) return send(msg.chat.id, 'Use: <code>/phvend 112348 | gross:145</code> or <code>/phvend 112348 | gross:145</code>');
+  const km = parsed.end_mileage - Number(active.start_mileage || 0);
+  if (!(km >= 0)) return send(msg.chat.id, 'End mileage cannot be lower than start mileage.');
+  const endedAt = telegramMessageIso(msg);
+  const autoHours = durationHoursBetween(active.started_at, endedAt);
+  const effectiveHours = Number.isFinite(parsed.hours_worked) ? parsed.hours_worked : autoHours;
+  if (!Number.isFinite(effectiveHours) || effectiveHours <= 0) return send(msg.chat.id, 'Could not determine hours worked yet. Try again in a few minutes or add <code>hours:x.x</code>.');
+  let petrol = parsed.petrol_cost;
+  let autoPetrol = false;
+  if (petrol === null || petrol === undefined) {
+    const settings = await getOrCreatePhvSettings(msg);
+    petrol = calculatePhvPetrolCost(km, settings) ?? 0;
+    autoPetrol = true;
+  }
+  const payload = {
+    telegram_user_id: msg.from.id,
+    chat_id: msg.chat.id,
+    log_date: parsed.log_date,
+    gross_amount: parsed.gross_amount,
+    hours_worked: effectiveHours,
+    km_driven: km,
+    petrol_cost: petrol,
+    start_mileage: Number(active.start_mileage),
+    end_mileage: parsed.end_mileage,
+    notes: parsed.notes,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+  };
+  const { error: insertErr } = await supabase.from('phv_logs').insert(payload);
+  if (insertErr) { console.error(insertErr); return send(msg.chat.id, 'Could not save PHV session end log.'); }
+  const { error: delErr } = await supabase.from('phv_active_session').delete().eq('telegram_user_id', msg.from.id);
+  if (delErr) console.error(delErr);
+  const maintenanceItems = await getMaintenanceItems(msg.from.id);
+  const c = phvComputed(payload);
+  const allLogs = await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString());
+  const comparable = summarizeComparableSessions(allLogs, getDayType(payload.log_date), payload.log_date);
+  const score = scoreSession(c.hourlyNet);
+  const lines = [
+    '<b>PHV session ended</b>',
+    `Start time: <b>${escapeHtml(formatDateTime(active.started_at))}</b>`,
+    `End time: <b>${escapeHtml(formatDateTime(endedAt))}</b>`,
+    `Duration: <b>${escapeHtml(formatDurationHours(effectiveHours))}</b>`,
+    `Start mileage: <b>${num(active.start_mileage, 0)}</b>`,
+    `End mileage: <b>${num(parsed.end_mileage, 0)}</b>`,
+    `Session KM: <b>${num(km)}</b>`,
+    `Gross: <b>${currency(payload.gross_amount)}</b>`,
+    `Petrol: <b>${currency(petrol)}</b>`,
+    `Net: <b>${currency(c.net)}</b>`,
+    `Hours: <b>${num(payload.hours_worked)}</b>`,
+    `Hourly net: <b>${currency(c.hourlyNet)}</b>`,
+    `Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
+    `Signal: <b>${escapeHtml(buildStopRecommendation(payload, comparable))}</b>`,
+  ];
+  if (parsed.hours_worked === null) lines.push('Hours source: <b>auto from Telegram timestamps</b>');
+  if (autoPetrol) lines.push('Petrol source: <b>auto-filled from PHV settings</b>');
+  lines.push(...maintenanceWatchLines(maintenanceItems, parsed.end_mileage));
+  return send(msg.chat.id, lines.join('\n'), { reply_markup: { inline_keyboard: [[{ text: '🛠 Maintenance', callback_data: 'show:maintstatus' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }]] } });
+}
+async function handlePhvToday(msg, editContext = null) {
+  await ensureUser(msg);
+  const logs = await getPhvRange(msg.from.id, todayDateString(), todayDateString());
+  if (!logs.length) return editContext ? editOrSend(msg.chat.id, editContext.messageId, 'No PHV logs for today yet.', { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, 'No PHV logs for today yet.', { reply_markup: MAIN_KEYBOARD });
+  const s = summarizePhv(logs);
+  const score = scoreSession(s.hourlyNet);
+  const comparable = summarizeComparableSessions(await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString()), getDayType(todayDateString()), todayDateString());
+  const text = [
+    '<b>PHV today</b>',
+    `Entries: <b>${s.count}</b>`,
+    `Gross: <b>${currency(s.gross)}</b>`,
+    `Petrol: <b>${currency(s.petrol)}</b>`,
+    `Net: <b>${currency(s.net)}</b>`,
+    `Hours: <b>${num(s.hours)}</b>`,
+    `Hourly net: <b>${currency(s.hourlyNet)}</b>`,
+    `Score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
+    `Signal: <b>${escapeHtml(buildStopRecommendation({ log_date: todayDateString(), gross_amount: s.gross, petrol_cost: s.petrol, hours_worked: s.hours }, comparable))}</b>`,
   ].join('\n');
-  const extra = { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🔗 Link Hub', callback_data: 'show:linkhub' }]] } };
-  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, extra) : send(msg.chat.id, text, extra);
+  const opts = { reply_markup: { inline_keyboard: [[{ text: '📈 PHV Week', callback_data: 'show:phvweek' }, { text: '❓ Should I Drive', callback_data: 'show:shoulddrive' }]] } };
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, opts) : send(msg.chat.id, text, opts);
 }
-async function handleMatchGrant(msg, body) {
+async function handlePhvWeek(msg, editContext = null) {
   await ensureUser(msg);
-  const query = String(body || '').trim();
-  if (!query) return send(msg.chat.id, 'Use: <code>/matchgrant your client need</code>');
-  try {
-    const items = await getGrantSupports(100);
-    const detectedIndustry = detectIndustryFromText(query);
-    const detectedTags = detectProblemTags(query);
-    const ranked = items
-      .map((item) => ({ item, score: scoreGrantMatch(item, query, detectedIndustry, detectedTags) }))
-      .filter((x) => x.score > 0)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 8)
-      .map((x) => x.item);
-    if (!ranked.length) {
-      return send(msg.chat.id, [
-        '<b>Recommended support</b>',
-        '',
-        `Need: <blockquote>${escapeHtml(query)}</blockquote>`,
-        'No direct match found yet in your grant dataset.',
-        'Try adding more records into <code>grants_master</code> or use more specific keywords like <code>aircon</code>, <code>chiller</code>, <code>chatbot</code>, <code>overseas</code>, <code>POS</code>.',
-      ].join('\n'));
-    }
-    const stack = buildSupportStackFromMatches(ranked);
-    const lines = [
-      '<b>Recommended support stack</b>',
-      '',
-      `Need: <blockquote>${escapeHtml(query)}</blockquote>`,
-      detectedIndustry ? `Industry detected: <b>${escapeHtml(detectedIndustry)}</b>` : null,
-      detectedTags.length ? `Problem tags: <b>${escapeHtml(detectedTags.join(', '))}</b>` : null,
-      '',
-    ].filter(Boolean);
-    if (stack.funding.length) {
-      lines.push('<b>Funding layer</b>');
-      stack.funding.slice(0, 3).forEach((item) => lines.push(formatGrantSupportLine(item, { includeWebpage: true, includeMeta: true })));
-      lines.push('');
-    }
-    if (stack.execution.length) {
-      lines.push('<b>Execution / implementation layer</b>');
-      stack.execution.slice(0, 3).forEach((item) => lines.push(formatGrantSupportLine(item, { includeWebpage: true, includeMeta: true })));
-      lines.push('');
-    }
-    if (stack.capability.length) {
-      lines.push('<b>Capability / training layer</b>');
-      stack.capability.slice(0, 3).forEach((item) => lines.push(formatGrantSupportLine(item, { includeWebpage: true, includeMeta: true })));
-      lines.push('');
-    }
-    lines.push('<b>Why this stack works</b>');
-    lines.push('• Combines funding with execution support and capability-building where possible.');
-    return send(msg.chat.id, lines.join('\n').trim(), { reply_markup: { inline_keyboard: [[{ text: '🏛 Grants', callback_data: 'show:grants' }, { text: '🏭 By Industry', callback_data: 'show:industryhelp' }], [{ text: '🆕 Grant Updates', callback_data: 'show:latestgrants' }]] } });
-  } catch (err) {
-    console.error(err);
-    return send(msg.chat.id, 'Could not run grant matching.');
-  }
+  const end = todayDateString();
+  const start = addDays(end, -6);
+  const logs = await getPhvRange(msg.from.id, start, end);
+  if (!logs.length) return editContext ? editOrSend(msg.chat.id, editContext.messageId, 'No PHV logs in the past 7 days yet.', { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, 'No PHV logs in the past 7 days yet.', { reply_markup: MAIN_KEYBOARD });
+  const s = summarizePhv(logs);
+  const score = scoreSession(s.hourlyNet);
+  const weekday = summarizePhv(logs.filter((x) => getDayType(x.log_date) === 'weekday'));
+  const weekend = summarizePhv(logs.filter((x) => getDayType(x.log_date) === 'weekend'));
+  const text = [
+    '<b>PHV past 7 days</b>',
+    `Range: <b>${escapeHtml(start)}</b> to <b>${escapeHtml(end)}</b>`,
+    `Entries: <b>${s.count}</b>`,
+    `Gross: <b>${currency(s.gross)}</b>`,
+    `Petrol: <b>${currency(s.petrol)}</b>`,
+    `Net: <b>${currency(s.net)}</b>`,
+    `Hours: <b>${num(s.hours)}</b>`,
+    `Avg hourly net: <b>${currency(s.hourlyNet)}</b>`,
+    `Overall score: <b>${score.emoji} ${escapeHtml(score.label)}</b>`,
+    '',
+    '<b>Weekday vs weekend</b>',
+    `• Weekday avg hourly net: <b>${currency(weekday.hourlyNet)}</b> from <b>${weekday.count}</b> log(s)`,
+    `• Weekend avg hourly net: <b>${currency(weekend.hourlyNet)}</b> from <b>${weekend.count}</b> log(s)`,
+  ].join('\n');
+  const opts = { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '❓ Should I Drive', callback_data: 'show:shoulddrive' }], [{ text: '🛠 Maintenance', callback_data: 'show:maintstatus' }]] } };
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, opts) : send(msg.chat.id, text, opts);
 }
-async function handleGrantMorning(msg) {
+async function handleShouldDrive(msg, editContext = null) {
   await ensureUser(msg);
-  try {
-    const updates = await getGrantUpdates(5);
-    const items = await getGrantSupports(12);
-    const highPriority = items.filter((x) => Number(x.priority || 0) >= 80).slice(0, 3);
-    const text = [
-      'Good morning ☀️',
-      '',
-      '<b>Grants & support updates</b>',
-      ...(updates.length ? updates.map((item) => `• ${escapeHtml(item.title || 'Untitled update')}`) : ['• No new grant updates found yet.']),
-      '',
-      '<b>Useful for clients today</b>',
-      ...(highPriority.length ? highPriority.map((item) => `• ${escapeHtml(item.name)} — ${escapeHtml(item.description || '')}`) : ['• Add high-priority records into <code>grants_master</code> to surface advisor picks here.']),
-    ].join('\n');
-    return send(msg.chat.id, text, { reply_markup: { inline_keyboard: [[{ text: '🆕 Full Updates', callback_data: 'show:latestgrants' }, { text: '🏛 Grants', callback_data: 'show:grants' }], [{ text: '🏭 By Industry', callback_data: 'show:industryhelp' }]] } });
-  } catch (err) {
-    console.error(err);
-    return send(msg.chat.id, 'Could not build the grant morning update.');
-  }
+  const logs = await getPhvRange(msg.from.id, addYears(todayDateString(), -1), todayDateString());
+  const dayType = getDayType(todayDateString());
+  const comparable = summarizeComparableSessions(logs, dayType, todayDateString());
+  const advice = buildShouldDriveAdvice(dayType, comparable);
+  const text = [
+    '<b>Should I drive today?</b>',
+    `Today type: <b>${escapeHtml(dayType)}</b>`,
+    `Comparable sessions used: <b>${comparable.count}</b>`,
+    `Recent avg hourly net: <b>${currency(comparable.hourlyNet)}</b>`,
+    '',
+    `<b>${escapeHtml(advice.headline)}</b>`,
+    `• ${escapeHtml(advice.recommendation)}`,
+    `• Confidence: <b>${escapeHtml(advice.confidence)}</b>`,
+  ].join('\n');
+  const opts = { reply_markup: { inline_keyboard: [[{ text: '🚗 PHV Today', callback_data: 'show:phvtoday' }, { text: '📈 PHV Week', callback_data: 'show:phvweek' }], [{ text: '➕ Menu', callback_data: 'show:menu' }]] } };
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, opts) : send(msg.chat.id, text, opts);
 }
+
 function buildDecisionAdvice(prompt) {
   const text = String(prompt || '').toLowerCase();
   const isDelay = /(wait|later|delay|postpone)/.test(text);
@@ -1001,12 +1107,11 @@ function parseNaturalLanguage(text) {
   if (/^maintenance$/i.test(trimmed)) return { type: 'maintenance' };
   if (/^phv settings$/i.test(trimmed)) return { type: 'phvsettings' };
   if (/^(should i drive|drive today\??)$/i.test(trimmed)) return { type: 'shoulddrive' };
-  if (/^(good morning|gm)$/i.test(trimmed)) return { type: 'grantmorning' };
-  if (/^(grants|grant list)$/i.test(trimmed)) return { type: 'grants' };
+  if (/^(good morning|gm)$/i.test(trimmed)) return { type: 'gm' };
+  if (/^(grants|grant directory)$/i.test(trimmed)) return { type: 'grants' };
   if (/^(latest grants|grant updates)$/i.test(trimmed)) return { type: 'latestgrants' };
-  if ((m = trimmed.match(/^(industry grants|support for)\s*:\s*(.+)$/i))) return { type: 'industrygrant', body: m[2].trim() };
-  if ((m = trimmed.match(/^industry\s+(.+)$/i))) return { type: 'industrygrant', body: m[1].trim() };
-  if (/^(grant hub|link hub)$/i.test(trimmed)) return { type: 'linkhub' };
+  if (/^(support|supportable programmes)$/i.test(trimmed)) return { type: 'support' };
+  if (/^(link hub|linkhub)$/i.test(trimmed)) return { type: 'linkhub' };
   return null;
 }
 async function handleNaturalLanguage(msg, parsed) {
@@ -1028,16 +1133,224 @@ async function handleNaturalLanguage(msg, parsed) {
     case 'phvweek': return handlePhvWeek(msg);
     case 'phvsettings': return handlePhvSettings(msg);
     case 'shoulddrive': return handleShouldDrive(msg);
+    case 'gm': return handleGrantDigest(msg);
     case 'grants': return handleGrants(msg);
-    case 'latestgrants': return handleGrantUpdates(msg);
-    case 'industrygrant': return handleIndustryGrant(msg, parsed.body);
-    case 'linkhub': return handleGrantLinkHub(msg);
-    case 'grantmorning': return handleGrantMorning(msg);
+    case 'latestgrants': return handleLatestGrants(msg);
+    case 'support': return handleSupport(msg);
+    case 'linkhub': return handleLinkHub(msg);
     case 'maintenance': return handleMaintenance(msg);
     case 'addmaintenance': return handleAddMaintenance(msg, parsed.body);
     case 'maintdone': return handleMaintDone(msg, parsed.body);
     default: return send(msg.chat.id, 'Unknown input. Use /help');
   }
+}
+
+
+
+function normalizeGrantText(value = '') {
+  return String(value || '').trim().toLowerCase();
+}
+
+function detectIndustryAlias(text = '') {
+  const lower = normalizeGrantText(text);
+  if (/(f&b|fnb|food|beverage|restaurant|cafe|hawker)/.test(lower)) return 'f&b';
+  if (/(retail|shop|store|merchant)/.test(lower)) return 'retail';
+  if (/(manufacturing|factory|maker|production)/.test(lower)) return 'manufacturing';
+  if (/(service|services|agency|consultancy)/.test(lower)) return 'services';
+  if (/(startup|founder|new business)/.test(lower)) return 'startup';
+  return null;
+}
+
+async function getActiveSupports(limit = 80) {
+  const { data, error } = await supabase
+    .from('grants_master')
+    .select('*')
+    .eq('status', 'active')
+    .order('priority', { ascending: false, nullsFirst: false })
+    .order('name', { ascending: true })
+    .limit(limit);
+  if (error) {
+    console.error(error);
+    return [];
+  }
+  return data || [];
+}
+
+async function getLatestGrantUpdates(limit = 8) {
+  const { data, error } = await supabase
+    .from('grant_updates')
+    .select('*')
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (error) {
+    console.error(error);
+    return [];
+  }
+  return data || [];
+}
+
+function formatSupportDirectory(items, title = 'Grants & Support') {
+  if (!items.length) return 'No grants or support programmes found yet.';
+  const grouped = {};
+  for (const item of items) {
+    const key = item.category || 'Other Support';
+    if (!grouped[key]) grouped[key] = [];
+    grouped[key].push(item);
+  }
+  const lines = [`<b>${escapeHtml(title)}</b>`, ''];
+  Object.keys(grouped).sort().forEach((group) => {
+    lines.push(`<b>${escapeHtml(group)}</b>`);
+    grouped[group].forEach((item) => {
+      lines.push(`• <b>${escapeHtml(item.name)}</b> (${escapeHtml(item.support_type || 'Support')})`);
+      if (item.description) lines.push(`  ${escapeHtml(item.description)}`);
+      if (item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
+    });
+    lines.push('');
+  });
+  return lines.join('\n').trim();
+}
+
+function formatLinkHub(items) {
+  if (!items.length) return 'No support links found yet.';
+  const lines = ['<b>One-Stop Support Link Hub</b>', ''];
+  items.slice(0, 18).forEach((item) => {
+    lines.push(`• <b>${escapeHtml(item.name)}</b>`);
+    if (item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
+  });
+  return lines.join('\n');
+}
+
+function formatGrantUpdatesText(items) {
+  if (!items.length) return 'No grant or programme updates found yet.';
+  const lines = ['<b>Latest Grants & Programme Updates</b>', ''];
+  items.forEach((item) => {
+    lines.push(`• <b>${escapeHtml(item.title)}</b>`);
+    if (item.summary) lines.push(`  ${escapeHtml(item.summary)}`);
+    if (item.client_angle) lines.push(`  Useful for clients: ${escapeHtml(item.client_angle)}`);
+    if (item.webpage) lines.push(`  ${escapeHtml(item.webpage)}`);
+  });
+  return lines.join('\n');
+}
+
+function scoreSupportMatch(item, queryText, industry) {
+  const q = normalizeGrantText(queryText);
+  let score = Number(item.priority || 0);
+  const haystacks = [];
+  if (item.name) haystacks.push(normalizeGrantText(item.name));
+  if (item.description) haystacks.push(normalizeGrantText(item.description));
+  for (const k of item.keywords || []) haystacks.push(normalizeGrantText(k));
+  for (const k of item.problem_solved || []) haystacks.push(normalizeGrantText(k));
+  for (const k of item.industries || []) haystacks.push(normalizeGrantText(k));
+  for (const h of haystacks) {
+    if (h && q.includes(h)) score += 15;
+    if (h && h.includes(q) && q.length >= 4) score += 8;
+  }
+  for (const token of q.split(/[^a-z0-9&+]+/).filter(Boolean)) {
+    if (haystacks.some((h) => h.includes(token))) score += 4;
+  }
+  if (industry && Array.isArray(item.industries)) {
+    const inds = item.industries.map((x) => normalizeGrantText(x));
+    if (inds.includes(industry) || inds.includes('all')) score += 20;
+  }
+  return score;
+}
+
+function formatSupportStack(items, queryText, industry) {
+  if (!items.length) return `No strong support match found for: <b>${escapeHtml(queryText)}</b>`;
+  const funding = items.filter((x) => /funding/i.test(x.support_level || '') || /grant/i.test(x.support_type || ''));
+  const execution = items.filter((x) => /execution/i.test(x.support_level || '') || /centre|programme|ihl support/i.test(x.support_type || ''));
+  const capability = items.filter((x) => /capability/i.test(x.support_level || ''));
+  const lines = ['<b>Recommended Support Stack</b>', `Need: <b>${escapeHtml(queryText)}</b>`];
+  if (industry) lines.push(`Industry detected: <b>${escapeHtml(industry)}</b>`);
+  lines.push('');
+  if (funding.length) {
+    lines.push('<b>Funding layer</b>');
+    funding.slice(0, 3).forEach((item) => {
+      lines.push(`• <b>${escapeHtml(item.name)}</b>`);
+      if (item.description) lines.push(`  ${escapeHtml(item.description)}`);
+    });
+    lines.push('');
+  }
+  if (execution.length) {
+    lines.push('<b>Execution / implementation layer</b>');
+    execution.slice(0, 3).forEach((item) => {
+      lines.push(`• <b>${escapeHtml(item.name)}</b>`);
+      if (item.description) lines.push(`  ${escapeHtml(item.description)}`);
+    });
+    lines.push('');
+  }
+  if (capability.length) {
+    lines.push('<b>Capability / training layer</b>');
+    capability.slice(0, 3).forEach((item) => {
+      lines.push(`• <b>${escapeHtml(item.name)}</b>`);
+      if (item.description) lines.push(`  ${escapeHtml(item.description)}`);
+    });
+    lines.push('');
+  }
+  const links = items.filter((x) => x.webpage).slice(0, 5);
+  if (links.length) {
+    lines.push('<b>Links</b>');
+    links.forEach((item) => lines.push(`• ${escapeHtml(item.name)} — ${escapeHtml(item.webpage)}`));
+  }
+  return lines.join('\n').trim();
+}
+
+async function handleGrants(msg, editContext = null) {
+  const items = await getActiveSupports(40);
+  const text = formatSupportDirectory(items, 'Grants & Support Directory');
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
+}
+
+async function handleSupport(msg, editContext = null) {
+  const items = await getActiveSupports(50);
+  const text = formatSupportDirectory(items, 'All Grants, Programmes, FIRCs & IHL Support');
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
+}
+
+async function handleLinkHub(msg, editContext = null) {
+  const items = await getActiveSupports(50);
+  const text = formatLinkHub(items);
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
+}
+
+async function handleLatestGrants(msg, editContext = null) {
+  const items = await getLatestGrantUpdates(8);
+  const text = formatGrantUpdatesText(items);
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
+}
+
+async function handleIndustryGrant(msg, body, editContext = null) {
+  const industry = detectIndustryAlias(body) || normalizeGrantText(body);
+  if (!industry) return send(msg.chat.id, 'Use: <code>/industrygrant f&b</code> or <code>/industrygrant retail</code>');
+  const items = await getActiveSupports(80);
+  const filtered = items.filter((item) => {
+    const inds = (item.industries || []).map((x) => normalizeGrantText(x));
+    return inds.includes('all') || inds.includes(industry);
+  });
+  const text = formatSupportDirectory(filtered, `Support for ${industry}`);
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
+}
+
+async function handleMatchGrant(msg, body, editContext = null) {
+  if (!body) return send(msg.chat.id, 'Use: <code>/matchgrant retail wants chatbot</code>');
+  const items = await getActiveSupports(80);
+  const industry = detectIndustryAlias(body);
+  const ranked = items
+    .map((item) => ({ item, score: scoreSupportMatch(item, body, industry) }))
+    .filter((x) => x.score >= 10)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8)
+    .map((x) => x.item);
+  const text = formatSupportStack(ranked, body, industry);
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
+}
+
+async function handleGrantDigest(msg) {
+  const items = await getLatestGrantUpdates(5);
+  const lines = ['<b>Good morning ☀️</b>', '', '<b>🏛 Grants & Support</b>'];
+  if (!items.length) lines.push('• No new grant updates found yet.');
+  items.forEach((item) => lines.push(`• ${escapeHtml(item.title)}`));
+  return send(msg.chat.id, lines.join('\n'), { reply_markup: MAIN_KEYBOARD });
 }
 
 function extractReceiptFields(text) {
@@ -1162,13 +1475,13 @@ async function routeMessage(msg) {
     case '/phvweek': return handlePhvWeek(msg);
     case '/phvsettings': return handlePhvSettings(msg);
     case '/shoulddrive': return handleShouldDrive(msg);
-    case '/grants':
-    case '/support': return handleGrants(msg);
-    case '/latestgrants': return handleGrantUpdates(msg);
+    case '/grants': return handleGrants(msg);
+    case '/support': return handleSupport(msg);
+    case '/linkhub': return handleLinkHub(msg);
+    case '/latestgrants': return handleLatestGrants(msg);
     case '/industrygrant': return handleIndustryGrant(msg, body);
-    case '/linkhub': return handleGrantLinkHub(msg);
     case '/matchgrant': return handleMatchGrant(msg, body);
-    case '/gm': return handleGrantMorning(msg);
+    case '/gm': return handleGrantDigest(msg);
     case '/decide': return handleDecide(msg, body);
     case '/addmaintenance': return handleAddMaintenance(msg, body);
     case '/maintenance':
@@ -1191,10 +1504,6 @@ async function routeCallback(query) {
     if (data === 'show:phvsettings') return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:shoulddrive') return handleShouldDrive(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:maintstatus') return handleMaintenance(fauxMsg, { messageId: msg.message_id });
-    if (data === 'show:grants') return handleGrants(fauxMsg, { messageId: msg.message_id });
-    if (data === 'show:latestgrants') return handleGrantUpdates(fauxMsg, { messageId: msg.message_id });
-    if (data === 'show:industryhelp') return handleIndustryGrantHelp(fauxMsg, { messageId: msg.message_id });
-    if (data === 'show:linkhub') return handleGrantLinkHub(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:phvstart') {
       pendingInputs.set(query.from.id, { kind: 'phvstart' });
       return send(msg.chat.id, 'Send your starting mileage. Example: <code>112280</code>');
@@ -1264,6 +1573,7 @@ async function routeCallback(query) {
 }
 
 app.get('/', (_req, res) => res.send('Bot is running.'));
+app.get('/health', (_req, res) => res.status(200).send('ok'));
 app.post(`/webhook/${TELEGRAM_BOT_TOKEN}`, async (req, res) => {
   try {
     const update = req.body;
@@ -1279,12 +1589,16 @@ app.post(`/webhook/${TELEGRAM_BOT_TOKEN}`, async (req, res) => {
   }
 });
 
+const server = app.listen(PORT, () => {
+  console.log(`Listening on ${PORT}`);
+});
+
 (async function start() {
   try {
-    await bot.setWebHook(`${WEBHOOK_URL}/webhook/${TELEGRAM_BOT_TOKEN}`);
-    app.listen(PORT, () => console.log(`Listening on ${PORT}`));
+    const webhookTarget = `${WEBHOOK_URL}/webhook/${TELEGRAM_BOT_TOKEN}`;
+    await bot.setWebHook(webhookTarget);
+    console.log(`Webhook configured: ${webhookTarget}`);
   } catch (err) {
-    console.error('Startup error', err);
-    process.exit(1);
+    console.error('Webhook setup error', err);
   }
 })();
