@@ -177,7 +177,7 @@ const MAIN_KEYBOARD = {
     ],
     [
       { text: '📰 News', callback_data: 'show:news' },
-      { text: '🏛 Grants', callback_data: 'show:grants' },
+      { text: '🔄 Refresh News', callback_data: 'show:refreshnews' },
     ],
   ],
 };
@@ -594,15 +594,12 @@ async function showHelp(chatId) {
     '<code>/maintenance</code>',
     '<code>/maintdone item | mileage | optional_cost | optional_note</code>',
     '',
-    '<b>Grants intelligence</b>',
-    '<code>/grants</code>',
-    '<code>/support</code>',
-    '<code>/linkhub</code>',
-    '<code>/latestgrants</code>',
-    '<code>/industrygrant f&b</code>',
-    '<code>/matchgrant retail wants chatbot</code>',
-    '<code>/gm</code>',
+    '<b>News</b>',
     '<code>/news</code>',
+    '<code>/news singapore</code>',
+    '<code>/news business</code>',
+    '<code>/news world</code>',
+    '<code>/gm</code>',
     '',
     '<b>OCR</b>',
     'Send a receipt screenshot/photo with a caption like <code>fuel</code>, <code>maintenance</code>, or <code>insurance</code>. The bot will OCR it and suggest what to save.',
@@ -1109,11 +1106,7 @@ function parseNaturalLanguage(text) {
   if (/^phv settings$/i.test(trimmed)) return { type: 'phvsettings' };
   if (/^(should i drive|drive today\??)$/i.test(trimmed)) return { type: 'shoulddrive' };
   if (/^(good morning|gm)$/i.test(trimmed)) return { type: 'gm' };
-  if (/^news$/i.test(trimmed)) return { type: 'news' };
-  if (/^(grants|grant directory)$/i.test(trimmed)) return { type: 'grants' };
-  if (/^(latest grants|grant updates)$/i.test(trimmed)) return { type: 'latestgrants' };
-  if (/^(support|supportable programmes)$/i.test(trimmed)) return { type: 'support' };
-  if (/^(link hub|linkhub)$/i.test(trimmed)) return { type: 'linkhub' };
+  if (/^(news|latest news)$/i.test(trimmed)) return { type: 'news' };
   return null;
 }
 async function handleNaturalLanguage(msg, parsed) {
@@ -1135,12 +1128,8 @@ async function handleNaturalLanguage(msg, parsed) {
     case 'phvweek': return handlePhvWeek(msg);
     case 'phvsettings': return handlePhvSettings(msg);
     case 'shoulddrive': return handleShouldDrive(msg);
-    case 'gm': return handleGrantDigest(msg);
-    case 'news': return handleNews(msg);
-    case 'grants': return handleGrants(msg);
-    case 'latestgrants': return handleLatestGrants(msg);
-    case 'support': return handleSupport(msg);
-    case 'linkhub': return handleLinkHub(msg);
+    case 'gm': return handleMorningDigest(msg);
+    case 'news': return handleNewsCommand(msg);
     case 'maintenance': return handleMaintenance(msg);
     case 'addmaintenance': return handleAddMaintenance(msg, parsed.body);
     case 'maintdone': return handleMaintDone(msg, parsed.body);
@@ -1403,116 +1392,184 @@ async function buildPhvTodaySnapshotText(userId) {
   ].join('\n');
 }
 
+async function fetchGoogleNewsRaw(url) {
+  const response = await axios.get(url, {
+    timeout: 12000,
+    responseType: 'text',
+    headers: { 'User-Agent': 'Mozilla/5.0 TelegramBot/1.0' }
+  });
+  return String(response.data || '');
+}
+
 function decodeXmlEntities(text = '') {
-  return String(text || '')
+  return String(text)
     .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'")
+    .replace(/&nbsp;/g, ' ')
     .trim();
 }
 
 function stripHtmlTags(text = '') {
-  return decodeXmlEntities(String(text || '').replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
+  return decodeXmlEntities(String(text).replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
 }
 
-function buildTldr(text = '', maxLen = 220) {
+function summarizeText(text = '', maxLen = 220) {
   const cleaned = stripHtmlTags(text);
   if (!cleaned) return 'TLDR: Tap the headline to read more.';
   if (cleaned.length <= maxLen) return `TLDR: ${cleaned}`;
   const cut = cleaned.slice(0, maxLen);
   const lastSpace = cut.lastIndexOf(' ');
-  const shortText = lastSpace > 80 ? cut.slice(0, lastSpace) : cut;
-  return `TLDR: ${shortText.trim()}…`;
+  const short = lastSpace > 80 ? cut.slice(0, lastSpace) : cut;
+  return `TLDR: ${short.trim()}…`;
 }
 
-function extractTagContent(block, tagName) {
-  const cdataRe = new RegExp(`<${tagName}[^>]*><!\[CDATA\[([\s\S]*?)\]\]><\/${tagName}>`, 'i');
-  const plainRe = new RegExp(`<${tagName}[^>]*>([\s\S]*?)<\/${tagName}>`, 'i');
-  const cdata = block.match(cdataRe);
-  if (cdata) return decodeXmlEntities(cdata[1]);
-  const plain = block.match(plainRe);
-  return plain ? decodeXmlEntities(plain[1]) : '';
+function extractTag(block, tagName) {
+  const regex = new RegExp(`<${tagName}[^>]*>([\\s\\S]*?)<\\/${tagName}>`, 'i');
+  const match = block.match(regex);
+  return match ? decodeXmlEntities(match[1]) : '';
 }
 
-function parseRssItems(xml = '', limit = 8) {
+function extractLink(block) {
+  const atomHref = block.match(/<link[^>]+href=["']([^"']+)["']/i);
+  if (atomHref) return decodeXmlEntities(atomHref[1]).trim();
+  const rssLink = extractTag(block, 'link');
+  if (rssLink && /^https?:/i.test(rssLink)) return rssLink.trim();
+  return '';
+}
+
+function parseNewsItems(xml = '') {
   const items = [];
-  const seen = new Set();
-  const itemBlocks = String(xml || '').match(/<item>[\s\S]*?<\/item>/gi) || [];
+  const itemBlocks = xml.match(/<item\b[\s\S]*?<\/item>/gi) || [];
   for (const block of itemBlocks) {
-    if (items.length >= limit) break;
-    const title = extractTagContent(block, 'title').replace(/\s+-\s+[^-]+$/, '').trim();
-    const link = extractTagContent(block, 'link').trim();
-    const description = extractTagContent(block, 'description').trim() || extractTagContent(block, 'content:encoded').trim();
-    if (!title || !link) continue;
-    const key = `${title}||${link}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    items.push({ title, link, summary: description });
+    const title = extractTag(block, 'title').replace(/\s+-\s+[^-]+$/, '').trim();
+    const link = extractLink(block);
+    const summary = extractTag(block, 'description') || extractTag(block, 'content:encoded');
+    if (title && link) items.push({ title, link, summary });
+  }
+  if (items.length) return items;
+
+  const entryBlocks = xml.match(/<entry\b[\s\S]*?<\/entry>/gi) || [];
+  for (const block of entryBlocks) {
+    const title = extractTag(block, 'title').replace(/\s+-\s+[^-]+$/, '').trim();
+    const link = extractLink(block);
+    const summary = extractTag(block, 'summary') || extractTag(block, 'content');
+    if (title && link) items.push({ title, link, summary });
   }
   return items;
 }
 
-async function fetchTopNewsItems(limit = 8) {
-  const sources = [
+const NEWS_FEEDS = {
+  top: [
     'https://news.google.com/rss?hl=en-SG&gl=SG&ceid=SG:en',
-    'https://www.channelnewsasia.com/rssfeeds/8395986'
-  ];
+    'https://news.google.com/rss/search?q=Singapore&hl=en-SG&gl=SG&ceid=SG:en'
+  ],
+  singapore: [
+    'https://news.google.com/rss/search?q=Singapore&hl=en-SG&gl=SG&ceid=SG:en',
+    'https://news.google.com/rss?hl=en-SG&gl=SG&ceid=SG:en'
+  ],
+  business: [
+    'https://news.google.com/rss/search?q=business&hl=en-SG&gl=SG&ceid=SG:en'
+  ],
+  world: [
+    'https://news.google.com/rss/search?q=world&hl=en-SG&gl=SG&ceid=SG:en'
+  ]
+};
+
+const newsCache = new Map();
+
+async function fetchNewsItems(category = 'top', limit = 10, forceRefresh = false) {
+  const key = `${category}:${limit}`;
+  const cached = newsCache.get(key);
+  const now = Date.now();
+  if (!forceRefresh && cached && now - cached.ts < 10 * 60 * 1000) return cached.items;
+
+  const sources = NEWS_FEEDS[category] || NEWS_FEEDS.top;
   for (const url of sources) {
     try {
-      const response = await axios.get(url, { timeout: 10000, responseType: 'text' });
-      const xml = String(response.data || '');
-      const items = parseRssItems(xml, limit);
-      if (items.length) return items.slice(0, limit);
+      const xml = await fetchGoogleNewsRaw(url);
+      const items = parseNewsItems(xml)
+        .filter((x) => x.title && x.link)
+        .filter((x, i, arr) => arr.findIndex((y) => y.link === x.link || y.title === x.title) === i)
+        .slice(0, limit);
+      if (items.length) {
+        newsCache.set(key, { ts: now, items });
+        return items;
+      }
     } catch (err) {
-      console.error('News fetch failed:', err.message);
+      console.error(`News fetch failed for ${category}:`, err.message);
     }
   }
-  return [];
+  return cached?.items || [];
 }
 
-function buildNewsSnapshotText(items) {
-  const lines = ['<b>📰 News</b>', ''];
+function buildNewsSnapshotText(items, header = '📰 News') {
+  const lines = [`<b>${escapeHtml(header)}</b>`];
   if (!items.length) {
-    lines.push('No live news items are available right now.');
+    lines.push('• No live news items are available right now.');
     return lines.join('\n');
   }
   items.forEach((item, index) => {
-    const title = item?.title || 'Untitled';
-    const link = item?.link || '';
-    const tldr = buildTldr(item?.summary || '');
-    if (link) {
-      lines.push(`${index + 1}. <a href="${escapeHtml(link)}">${escapeHtml(title)}</a>`);
-    } else {
-      lines.push(`${index + 1}. <b>${escapeHtml(title)}</b>`);
-    }
-    lines.push(escapeHtml(tldr));
+    lines.push('');
+    lines.push(`${index + 1}. <a href="${escapeHtml(item.link)}">${escapeHtml(item.title)}</a>`);
+    lines.push(escapeHtml(summarizeText(item.summary)));
     lines.push('');
   });
   return lines.join('\n');
 }
 
-async function handleNews(msg, editContext = null) {
+async function handleNewsCommand(msg, category = 'top', editContext = null, forceRefresh = false) {
   await ensureUser(msg);
-  const items = await fetchTopNewsItems(10);
-  const text = buildNewsSnapshotText(items);
-  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, { reply_markup: MAIN_KEYBOARD }) : send(msg.chat.id, text, { reply_markup: MAIN_KEYBOARD });
+  const normalized = ['top', 'singapore', 'business', 'world'].includes(String(category || '').toLowerCase())
+    ? String(category).toLowerCase()
+    : 'top';
+  const items = await fetchNewsItems(normalized, 12, forceRefresh);
+  const titleMap = {
+    top: '📰 Top News',
+    singapore: '🇸🇬 Singapore News',
+    business: '💼 Business News',
+    world: '🌍 World News'
+  };
+  const text = buildNewsSnapshotText(items, titleMap[normalized]);
+  const opts = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: 'Top', callback_data: 'show:news:top' },
+          { text: 'Singapore', callback_data: 'show:news:singapore' },
+          { text: 'Business', callback_data: 'show:news:business' },
+          { text: 'World', callback_data: 'show:news:world' }
+        ],
+        [
+          { text: 'Refresh', callback_data: `show:refreshnews:${normalized}` },
+          { text: '📅 Due', callback_data: 'show:due' }
+        ]
+      ]
+    }
+  };
+  return editContext ? editOrSend(msg.chat.id, editContext.messageId, text, opts) : send(msg.chat.id, text, opts);
 }
 
-async function handleGrantDigest(msg) {
+async function handleMorningDigest(msg) {
   await ensureUser(msg);
-  const [{ reminders, adminItems }, phvText, items] = await Promise.all([
+  const [{ reminders, adminItems }, phvText, topItems, sgItems, bizItems] = await Promise.all([
     getDueItems(msg.from.id),
     buildPhvTodaySnapshotText(msg.from.id),
-    fetchTopNewsItems(8),
+    fetchNewsItems('top', 4),
+    fetchNewsItems('singapore', 4),
+    fetchNewsItems('business', 4),
   ]);
   const lines = [
     '<b>Good morning ☀️</b>',
     '',
-    buildNewsSnapshotText(items),
+    buildNewsSnapshotText(topItems, '📰 Top News'),
+    '',
+    buildNewsSnapshotText(sgItems, '🇸🇬 Singapore News'),
+    '',
+    buildNewsSnapshotText(bizItems, '💼 Business News'),
     '',
     buildDueSnapshotText(reminders, adminItems),
     '',
@@ -1520,7 +1577,6 @@ async function handleGrantDigest(msg) {
   ];
   return send(msg.chat.id, lines.join('\n'), { reply_markup: MAIN_KEYBOARD });
 }
-
 
 function extractReceiptFields(text) {
   const clean = String(text || '').replace(/\r/g, '');
@@ -1644,14 +1700,8 @@ async function routeMessage(msg) {
     case '/phvweek': return handlePhvWeek(msg);
     case '/phvsettings': return handlePhvSettings(msg);
     case '/shoulddrive': return handleShouldDrive(msg);
-    case '/grants': return handleGrants(msg);
-    case '/support': return handleSupport(msg);
-    case '/linkhub': return handleLinkHub(msg);
-    case '/latestgrants': return handleLatestGrants(msg);
-    case '/industrygrant': return handleIndustryGrant(msg, body);
-    case '/matchgrant': return handleMatchGrant(msg, body);
-    case '/gm': return handleGrantDigest(msg);
-    case '/news': return handleNews(msg);
+    case '/news': return handleNewsCommand(msg, body ? body.toLowerCase() : 'top');
+    case '/gm': return handleMorningDigest(msg);
     case '/decide': return handleDecide(msg, body);
     case '/addmaintenance': return handleAddMaintenance(msg, body);
     case '/maintenance':
@@ -1674,9 +1724,16 @@ async function routeCallback(query) {
     if (data === 'show:phvsettings') return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:shoulddrive') return handleShouldDrive(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:maintstatus') return handleMaintenance(fauxMsg, { messageId: msg.message_id });
-    if (data === 'show:grants') return handleGrants(fauxMsg, { messageId: msg.message_id });
-    if (data === 'show:grantupdates') return handleLatestGrants(fauxMsg, { messageId: msg.message_id });
-    if (data === 'show:news') return handleNews(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:news') return handleNewsCommand(fauxMsg, 'top', { messageId: msg.message_id });
+    if (data.startsWith('show:news:')) {
+      const category = (data.split(':')[2] || 'top').toLowerCase();
+      return handleNewsCommand(fauxMsg, category, { messageId: msg.message_id });
+    }
+    if (data === 'show:refreshnews') return handleNewsCommand(fauxMsg, 'top', { messageId: msg.message_id }, true);
+    if (data.startsWith('show:refreshnews:')) {
+      const category = (data.split(':')[2] || 'top').toLowerCase();
+      return handleNewsCommand(fauxMsg, category, { messageId: msg.message_id }, true);
+    }
     if (data === 'show:phvstart') {
       pendingInputs.set(query.from.id, { kind: 'phvstart' });
       return send(msg.chat.id, 'Send your starting mileage. Example: <code>112280</code>');
