@@ -175,6 +175,10 @@ const MAIN_KEYBOARD = {
       { text: '⛽ PHV Settings', callback_data: 'show:phvsettings' },
       { text: '🛠 Maintenance', callback_data: 'show:maintstatus' },
     ],
+    [
+      { text: '🏛 Grants', callback_data: 'show:grants' },
+      { text: '📢 Grant Updates', callback_data: 'show:grantupdates' },
+    ],
   ],
 };
 
@@ -590,8 +594,14 @@ async function showHelp(chatId) {
     '<code>/maintenance</code>',
     '<code>/maintdone item | mileage | optional_cost | optional_note</code>',
     '',
+    '<b>Grants intelligence</b>',
+    '<code>/grants</code>',
+    '<code>/support</code>',
+    '<code>/linkhub</code>',
+    '<code>/latestgrants</code>',
+    '<code>/industrygrant f&b</code>',
+    '<code>/matchgrant retail wants chatbot</code>',
     '<code>/gm</code>',
-    '<code>/news</code>',
     '',
     '<b>OCR</b>',
     'Send a receipt screenshot/photo with a caption like <code>fuel</code>, <code>maintenance</code>, or <code>insurance</code>. The bot will OCR it and suggest what to save.',
@@ -1098,6 +1108,10 @@ function parseNaturalLanguage(text) {
   if (/^phv settings$/i.test(trimmed)) return { type: 'phvsettings' };
   if (/^(should i drive|drive today\??)$/i.test(trimmed)) return { type: 'shoulddrive' };
   if (/^(good morning|gm)$/i.test(trimmed)) return { type: 'gm' };
+  if (/^(grants|grant directory)$/i.test(trimmed)) return { type: 'grants' };
+  if (/^(latest grants|grant updates)$/i.test(trimmed)) return { type: 'latestgrants' };
+  if (/^(support|supportable programmes)$/i.test(trimmed)) return { type: 'support' };
+  if (/^(link hub|linkhub)$/i.test(trimmed)) return { type: 'linkhub' };
   return null;
 }
 async function handleNaturalLanguage(msg, parsed) {
@@ -1120,6 +1134,10 @@ async function handleNaturalLanguage(msg, parsed) {
     case 'phvsettings': return handlePhvSettings(msg);
     case 'shoulddrive': return handleShouldDrive(msg);
     case 'gm': return handleGrantDigest(msg);
+    case 'grants': return handleGrants(msg);
+    case 'latestgrants': return handleLatestGrants(msg);
+    case 'support': return handleSupport(msg);
+    case 'linkhub': return handleLinkHub(msg);
     case 'maintenance': return handleMaintenance(msg);
     case 'addmaintenance': return handleAddMaintenance(msg, parsed.body);
     case 'maintdone': return handleMaintDone(msg, parsed.body);
@@ -1382,66 +1400,107 @@ async function buildPhvTodaySnapshotText(userId) {
   ].join('\n');
 }
 
-async function fetchTopNewsHeadlines(limit = 5) {
+function decodeXmlEntities(text = '') {
+  return String(text)
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .trim();
+}
+
+function normalizeGoogleNewsUrl(url = '') {
+  const raw = String(url || '').trim();
+  if (!raw) return '';
+  if (raw.startsWith('./')) return `https://news.google.com/${raw.slice(2)}`;
+  if (raw.startsWith('/')) return `https://news.google.com${raw}`;
+  return raw;
+}
+
+function stripFeedSuffix(title = '') {
+  return String(title || '').replace(/\s+-\s+[^-]+$/, '').trim();
+}
+
+async function fetchLiveNewsItems(limit = 5) {
   const sources = [
     'https://news.google.com/rss?hl=en-SG&gl=SG&ceid=SG:en',
     'https://www.channelnewsasia.com/rssfeeds/8395986'
   ];
+
   for (const url of sources) {
     try {
-      const response = await axios.get(url, { timeout: 10000, responseType: 'text' });
+      const response = await axios.get(url, {
+        timeout: 12000,
+        responseType: 'text',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 TelegramPersonalOpsBot/3.0'
+        }
+      });
       const xml = String(response.data || '');
-      const headlines = [];
-      const itemRegex = /<item>[\s\S]*?<title><!\[CDATA\[(.*?)\]\]><\/title>[\s\S]*?<\/item>|<item>[\s\S]*?<title>(.*?)<\/title>[\s\S]*?<\/item>/gi;
-      let match;
-      while ((match = itemRegex.exec(xml)) && headlines.length < limit) {
-        const raw = (match[1] || match[2] || '').trim();
-        if (!raw) continue;
-        const cleaned = raw
-          .replace(/&amp;/g, '&')
-          .replace(/&lt;/g, '<')
-          .replace(/&gt;/g, '>')
-          .replace(/\s+-\s+[^-]+$/, '')
-          .trim();
-        if (cleaned && !headlines.includes(cleaned)) headlines.push(cleaned);
+      const items = [];
+      const itemRegex = /<item>([\s\S]*?)<\/item>/gi;
+      let itemMatch;
+
+      while ((itemMatch = itemRegex.exec(xml)) && items.length < limit) {
+        const block = itemMatch[1] || '';
+        const titleMatch = block.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/i) || block.match(/<title>(.*?)<\/title>/i);
+        const linkMatch = block.match(/<link>(.*?)<\/link>/i);
+        const rawTitle = decodeXmlEntities(titleMatch ? titleMatch[1] : '');
+        const rawLink = decodeXmlEntities(linkMatch ? linkMatch[1] : '');
+        const title = stripFeedSuffix(rawTitle);
+        const link = normalizeGoogleNewsUrl(rawLink);
+        if (!title || !link) continue;
+        if (items.some((x) => x.title === title || x.link === link)) continue;
+        items.push({ title, link });
       }
-      if (headlines.length) return headlines.slice(0, limit);
+
+      if (items.length) return items.slice(0, limit);
     } catch (err) {
-      console.error('News fetch failed:', err.message);
+      console.error('Live news fetch failed:', err.message);
     }
   }
+
   return [];
 }
 
-function buildNewsSnapshotText(headlines) {
+function buildNewsSnapshotText(items) {
   const lines = ['<b>📰 News</b>'];
-  if (!headlines.length) {
+  if (!items.length) {
     lines.push('• News is temporarily unavailable.');
     return lines.join('\n');
   }
-  headlines.slice(0, 5).forEach((headline) => {
-    lines.push(`• ${escapeHtml(headline)}`);
+  items.slice(0, 5).forEach((item) => {
+    lines.push(`• <a href="${escapeHtml(item.link)}">${escapeHtml(item.title)}</a>`);
   });
+  lines.push('');
+  lines.push('Tap a headline to read more.');
   return lines.join('\n');
 }
 
 async function handleGrantDigest(msg) {
   await ensureUser(msg);
-  const [{ reminders, adminItems }, phvText, headlines] = await Promise.all([
+  const [{ reminders, adminItems }, phvText, newsItems] = await Promise.all([
     getDueItems(msg.from.id),
     buildPhvTodaySnapshotText(msg.from.id),
-    fetchTopNewsHeadlines(5),
+    fetchLiveNewsItems(5),
   ]);
   const lines = [
     '<b>Good morning ☀️</b>',
     '',
-    buildNewsSnapshotText(headlines),
+    buildNewsSnapshotText(newsItems),
     '',
     buildDueSnapshotText(reminders, adminItems),
     '',
     phvText,
   ];
   return send(msg.chat.id, lines.join('\n'), { reply_markup: MAIN_KEYBOARD });
+}
+
+async function handleNews(msg) {
+  await ensureUser(msg);
+  const newsItems = await fetchLiveNewsItems(8);
+  return send(msg.chat.id, buildNewsSnapshotText(newsItems), { reply_markup: MAIN_KEYBOARD });
 }
 
 
@@ -1567,8 +1626,14 @@ async function routeMessage(msg) {
     case '/phvweek': return handlePhvWeek(msg);
     case '/phvsettings': return handlePhvSettings(msg);
     case '/shoulddrive': return handleShouldDrive(msg);
-    case '/gm':
-    case '/news': return handleGrantDigest(msg);
+    case '/grants': return handleGrants(msg);
+    case '/support': return handleSupport(msg);
+    case '/linkhub': return handleLinkHub(msg);
+    case '/latestgrants': return handleLatestGrants(msg);
+    case '/industrygrant': return handleIndustryGrant(msg, body);
+    case '/matchgrant': return handleMatchGrant(msg, body);
+    case '/gm': return handleGrantDigest(msg);
+    case '/news': return handleNews(msg);
     case '/decide': return handleDecide(msg, body);
     case '/addmaintenance': return handleAddMaintenance(msg, body);
     case '/maintenance':
@@ -1591,6 +1656,8 @@ async function routeCallback(query) {
     if (data === 'show:phvsettings') return handlePhvSettings(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:shoulddrive') return handleShouldDrive(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:maintstatus') return handleMaintenance(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:grants') return handleGrants(fauxMsg, { messageId: msg.message_id });
+    if (data === 'show:grantupdates') return handleLatestGrants(fauxMsg, { messageId: msg.message_id });
     if (data === 'show:phvstart') {
       pendingInputs.set(query.from.id, { kind: 'phvstart' });
       return send(msg.chat.id, 'Send your starting mileage. Example: <code>112280</code>');
